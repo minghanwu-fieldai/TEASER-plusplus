@@ -175,8 +175,15 @@ teaser::MultiviewSolver::solveNodePose(const std::vector<teaser::NeighborEdge>& 
   return out;
 }
 
-teaser::MultiScanResult teaser::alignMultiScan(
-    const std::vector<teaser::PointCloud>& clouds, const teaser::Graph& adjacency,
+namespace {
+
+// Shared core of the multi-scan drivers. Given a set of undirected tree/forest edges and a
+// per-node anchor score, split into connected components (warning if more than one), pick each
+// component's anchor (max score, ties -> smallest index) as the identity pose, and propagate poses
+// outward along the tree in topological order (child = target, parent = fixed source).
+teaser::MultiScanResult alignAlongForest(
+    const std::vector<teaser::PointCloud>& clouds,
+    const std::vector<std::pair<int, int>>& forest_edges, const std::vector<double>& anchor_score,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
     const teaser::RobustRegistrationSolver::Params& params) {
   const int N = static_cast<int>(clouds.size());
@@ -189,25 +196,11 @@ teaser::MultiScanResult teaser::alignMultiScan(
   }
 
   auto edge_key = [](int a, int b) { return std::make_pair(std::min(a, b), std::max(a, b)); };
+  auto valid_edge = [N](const std::pair<int, int>& e) {
+    return e.first >= 0 && e.second >= 0 && e.first < N && e.second < N && e.first != e.second;
+  };
 
-  // --- 1. Weighted undirected edges (weight = #putative correspondences), then MST. ---
-  std::vector<teaser::WeightedEdge> weighted_edges;
-  const auto adj = adjacency.getAdjList();
-  const int V = std::min<int>(N, static_cast<int>(adj.size()));
-  for (int i = 0; i < V; ++i) {
-    for (const int j : adj[i]) {
-      if (j <= i || j >= N) {
-        continue; // visit each undirected edge once, ignore out-of-range vertices
-      }
-      const auto it = correspondences.find(edge_key(i, j));
-      const double w = (it != correspondences.end()) ? static_cast<double>(it->second.size()) : 0.0;
-      weighted_edges.push_back({i, j, w});
-    }
-  }
-  const std::vector<teaser::WeightedEdge> forest =
-      teaser::kruskalSpanningTree(N, weighted_edges, /*maximum=*/true);
-
-  // --- 2. Connected components via union-find over all adjacency edges. ---
+  // Connected components via union-find over the forest edges.
   std::vector<int> uf(N);
   std::iota(uf.begin(), uf.end(), 0);
   auto find = [&uf](int x) {
@@ -217,9 +210,12 @@ teaser::MultiScanResult teaser::alignMultiScan(
     }
     return x;
   };
-  for (const auto& e : weighted_edges) {
-    const int ra = find(e.u);
-    const int rb = find(e.v);
+  for (const auto& e : forest_edges) {
+    if (!valid_edge(e)) {
+      continue;
+    }
+    const int ra = find(e.first);
+    const int rb = find(e.second);
     if (ra != rb) {
       uf[rb] = ra;
     }
@@ -236,32 +232,30 @@ teaser::MultiScanResult teaser::alignMultiScan(
     result.component[i] = root_to_comp[find(i)];
   }
   if (result.num_components > 1) {
-    std::cerr << "[teaser::multiview] Warning: adjacency graph has " << result.num_components
+    std::cerr << "[teaser::multiview] Warning: graph has " << result.num_components
               << " connected components; aligning each independently.\n";
   }
 
-  // --- 3. Anchor per component = node with max total correspondence weight (tie: smallest id). ---
-  std::vector<double> node_weight(N, 0.0);
-  for (const auto& e : weighted_edges) {
-    node_weight[e.u] += e.weight;
-    node_weight[e.v] += e.weight;
-  }
+  // Anchor per component: max anchor_score, ties -> smallest index.
   std::vector<int> anchor(result.num_components, -1);
   for (int i = 0; i < N; ++i) {
     const int c = result.component[i];
-    if (anchor[c] < 0 || node_weight[i] > node_weight[anchor[c]]) {
-      anchor[c] = i; // ascending i + strict '>' => smallest index wins ties
+    if (anchor[c] < 0 || anchor_score[i] > anchor_score[anchor[c]]) {
+      anchor[c] = i;
     }
   }
 
-  // --- 4. Root each tree at its anchor, orient parent->child, then topological order. ---
+  // Root each tree at its anchor (BFS), orient parent->child, then topological order.
   std::vector<std::vector<int>> tree_adj(N);
-  for (const auto& e : forest) {
-    tree_adj[e.u].push_back(e.v);
-    tree_adj[e.v].push_back(e.u);
+  for (const auto& e : forest_edges) {
+    if (!valid_edge(e)) {
+      continue;
+    }
+    tree_adj[e.first].push_back(e.second);
+    tree_adj[e.second].push_back(e.first);
   }
   std::vector<int> tree_parent(N, -1);
-  std::vector<std::pair<int, int>> directed; // (parent, child)
+  std::vector<std::pair<int, int>> directed;
   std::vector<char> visited(N, 0);
   for (int c = 0; c < result.num_components; ++c) {
     const int root = anchor[c];
@@ -286,7 +280,7 @@ teaser::MultiScanResult teaser::alignMultiScan(
   }
   const std::vector<int> order = teaser::topologicalSort(N, directed);
 
-  // --- Anchors get the identity pose. ---
+  // Anchors get the identity pose.
   for (int c = 0; c < result.num_components; ++c) {
     if (anchor[c] >= 0) {
       result.poses[anchor[c]] = teaser::Pose{};
@@ -294,7 +288,7 @@ teaser::MultiScanResult teaser::alignMultiScan(
     }
   }
 
-  // --- 5. Propagate poses along the tree in topological order. ---
+  // Propagate poses along the tree in topological order.
   teaser::MultiviewSolver solver(params);
   for (const int node : order) {
     const int p = tree_parent[node];
@@ -350,4 +344,73 @@ teaser::MultiScanResult teaser::alignMultiScan(
   }
 
   return result;
+}
+
+} // namespace
+
+teaser::MultiScanResult teaser::alignMultiScan(
+    const std::vector<teaser::PointCloud>& clouds, const teaser::Graph& adjacency,
+    const std::map<std::pair<int, int>, double>& edge_weights,
+    const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
+    const teaser::RobustRegistrationSolver::Params& params) {
+  const int N = static_cast<int>(clouds.size());
+  teaser::MultiScanResult result;
+  result.poses.assign(N, teaser::Pose{});
+  result.valid.assign(N, false);
+  result.component.assign(N, -1);
+  if (N == 0) {
+    return result;
+  }
+
+  auto edge_key = [](int a, int b) { return std::make_pair(std::min(a, b), std::max(a, b)); };
+
+  // --- 1. Weighted undirected edges (weight supplied by the caller), then MST. ---
+  std::vector<teaser::WeightedEdge> weighted_edges;
+  const auto adj = adjacency.getAdjList();
+  const int V = std::min<int>(N, static_cast<int>(adj.size()));
+  for (int i = 0; i < V; ++i) {
+    for (const int j : adj[i]) {
+      if (j <= i || j >= N) {
+        continue; // visit each undirected edge once, ignore out-of-range vertices
+      }
+      const auto it = edge_weights.find(edge_key(i, j));
+      const double w = (it != edge_weights.end()) ? it->second : 0.0;
+      weighted_edges.push_back({i, j, w});
+    }
+  }
+  const std::vector<teaser::WeightedEdge> forest =
+      teaser::kruskalSpanningTree(N, weighted_edges, /*maximum=*/true);
+
+  // The MST edges become the propagation tree; anchors are scored by total incident edge weight.
+  std::vector<std::pair<int, int>> forest_edges;
+  forest_edges.reserve(forest.size());
+  for (const auto& e : forest) {
+    forest_edges.push_back({e.u, e.v});
+  }
+  std::vector<double> anchor_score(N, 0.0);
+  for (const auto& e : weighted_edges) {
+    anchor_score[e.u] += e.weight;
+    anchor_score[e.v] += e.weight;
+  }
+
+  return alignAlongForest(clouds, forest_edges, anchor_score, correspondences, params);
+}
+
+teaser::MultiScanResult teaser::alignMultiScanWithTree(
+    const std::vector<teaser::PointCloud>& clouds,
+    const std::vector<std::pair<int, int>>& tree_edges,
+    const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
+    const teaser::RobustRegistrationSolver::Params& params) {
+  const int N = static_cast<int>(clouds.size());
+  // Score anchors by tree degree: the most-connected node in the caller-provided tree.
+  std::vector<double> anchor_score(N, 0.0);
+  for (const auto& e : tree_edges) {
+    if (e.first >= 0 && e.first < N) {
+      anchor_score[e.first] += 1.0;
+    }
+    if (e.second >= 0 && e.second < N) {
+      anchor_score[e.second] += 1.0;
+    }
+  }
+  return alignAlongForest(clouds, tree_edges, anchor_score, correspondences, params);
 }

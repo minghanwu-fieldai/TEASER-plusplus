@@ -185,6 +185,7 @@ top of the existing pairwise pipeline (the core solver is unchanged).
 teaser::MultiScanResult teaser::alignMultiScan(
     const std::vector<teaser::PointCloud>& clouds,       // clouds[i] = scan i, in scan i's local frame
     const teaser::Graph& adjacency,                      // which scans overlap (vertices 0..N-1)
+    const std::map<std::pair<int,int>, double>& edge_weights,           // MST weight per edge, keyed by (min(i,j),max(i,j))
     const std::map<std::pair<int,int>,                   // per-edge putative correspondences, keyed by
                    std::vector<std::pair<int,int>>>& correspondences,  //   (min(i,j),max(i,j))
     const teaser::RobustRegistrationSolver::Params& params);
@@ -193,24 +194,39 @@ teaser::MultiScanResult teaser::alignMultiScan(
 **Contract**
 
 - *Inputs.* One `PointCloud` per scan (points expressed in that scan's own local frame); an
-  adjacency graph marking which scans overlap; and, for each adjacency edge `(i,j)`,
-  the **raw putative** correspondences keyed by `(min(i,j), max(i,j))`, where each pair `(a,b)` is
+  adjacency graph marking which scans overlap; a **caller-supplied MST edge weight** per edge
+  (keyed by `(min(i,j), max(i,j))`; missing edges count as weight 0); and, for each adjacency edge
+  `(i,j)`, the **raw putative** correspondences keyed the same way, where each pair `(a,b)` is
   `(index into cloud[min], index into cloud[max])`. Correspondences may contain outliers — the
   per-edge robust solve performs its own inlier selection (scale-consistency + max-clique +
   GNC-TLS). No feature matching is done for you.
 - *Assumptions.* Scale is fixed to `1` (rigid alignment). Adjacency vertices are `0..N-1`.
-- *What it does.* Builds a **maximum spanning tree** (edge weight = number of putative
-  correspondences), splits the graph into connected components (a warning is emitted if there is
-  more than one), picks the **most-connected node of each component as the anchor** (identity
-  pose), and propagates poses outward **along tree edges only**, in topological order, aligning
-  each child to its single already-posed parent.
+- *What it does.* Builds a **maximum spanning tree** using the caller-supplied edge weights (which
+  are independent of the correspondences — use any proxy such as overlap, proximity, or keypoint
+  count), splits the graph into connected components (a warning is emitted if there is more than
+  one), picks the **highest-total-weight node of each component as the anchor** (identity pose),
+  and propagates poses outward **along tree edges only**, in topological order, aligning each child
+  to its single already-posed parent. Because only tree edges are used, correspondences are
+  consulted for tree edges only.
 - *Output.* `MultiScanResult { poses, valid, component, num_components }` — one global pose
   (`local → world`: `world = R·local + t`) per scan. Poses are **gauge-fixed per component**: each
   component's anchor is the identity, so poses are only meaningful *relative to their component's
   anchor*, and separate components live in unrelated frames. `valid[i]` is `false` for any scan
   whose alignment failed or that was unreachable (e.g. its parent failed).
 - *Limitations.* Tree-only propagation (non-tree / loop-closure edges are not fused), no scale
-  estimation, and correspondences must be supplied by the caller.
+  estimation, and both the edge weights and correspondences must be supplied by the caller.
+
+**Bring your own tree.** If you would rather compute the spanning tree yourself, call
+`teaser::alignMultiScanWithTree(clouds, tree_edges, correspondences, params)` instead — it skips
+the MST step and propagates over the `tree_edges` you provide (undirected `(i,j)` pairs; the
+anchor of each component is the highest-degree node in your tree). Everything else — topological
+ordering, child-as-target alignment, and the per-component identity gauge — is identical.
+
+The given edges are treated as a forest: connected components are derived from them (a warning is
+still emitted if there is more than one), and any node not covered by an edge becomes its own
+single-node component with the identity pose. Extra edges that would create a cycle are tolerated —
+a BFS spanning tree of the supplied edges is used, so redundant edges are simply ignored rather
+than causing an error.
 
 See `test/teaser/multiview-test.cc` for end-to-end usage.
 

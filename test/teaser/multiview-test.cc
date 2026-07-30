@@ -67,6 +67,7 @@ teaser::RobustRegistrationSolver::Params makeParams(double noise_bound) {
 struct Scene {
   std::vector<teaser::PointCloud> clouds;
   teaser::Graph adjacency;
+  std::map<std::pair<int, int>, double> edge_weights;
   std::map<std::pair<int, int>, std::vector<std::pair<int, int>>> corr;
   std::vector<teaser::Pose> gt;
 };
@@ -103,6 +104,8 @@ Scene buildScene(const std::vector<teaser::Pose>& gt,
       pairs.push_back(i < j ? std::make_pair(ii, jj) : std::make_pair(jj, ii));
     }
     s.corr[{std::min(i, j), std::max(i, j)}] = pairs;
+    // Caller-supplied MST weight (uniform here; independent of the correspondences).
+    s.edge_weights[{std::min(i, j), std::max(i, j)}] = 1.0;
   }
 
   s.adjacency.populateVertices(N);
@@ -321,7 +324,8 @@ TEST(MultiviewTest, MultiScanConnected) {
   std::vector<std::pair<int, int>> edges = {{0, 1}, {1, 2}, {2, 3}, {0, 2}};
   auto scene = buildScene(gt, edges, /*k_in=*/30, /*k_out=*/8);
 
-  auto res = teaser::alignMultiScan(scene.clouds, scene.adjacency, scene.corr, makeParams(1e-3));
+  auto res = teaser::alignMultiScan(scene.clouds, scene.adjacency, scene.edge_weights, scene.corr,
+                                    makeParams(1e-3));
 
   ASSERT_EQ(res.num_components, 1);
   const int anchor = 2;
@@ -350,7 +354,8 @@ TEST(MultiviewTest, MultiScanDisconnected) {
   std::vector<std::pair<int, int>> edges = {{0, 1}, {2, 3}};
   auto scene = buildScene(gt, edges, /*k_in=*/30, /*k_out=*/5);
 
-  auto res = teaser::alignMultiScan(scene.clouds, scene.adjacency, scene.corr, makeParams(1e-3));
+  auto res = teaser::alignMultiScan(scene.clouds, scene.adjacency, scene.edge_weights, scene.corr,
+                                    makeParams(1e-3));
 
   EXPECT_EQ(res.num_components, 2);
   EXPECT_EQ(res.component[0], res.component[1]);
@@ -371,6 +376,35 @@ TEST(MultiviewTest, MultiScanDisconnected) {
   };
   check_rel(0, 1);
   check_rel(2, 3);
+}
+
+// Caller-provided tree (MST step skipped): same recovery as the MST path.
+TEST(MultiviewTest, MultiScanWithCallerTree) {
+  std::vector<teaser::Pose> gt(4);
+  gt[0].R = makeRotation(1, 0, 0, 0.0);        gt[0].t = Eigen::Vector3d(0, 0, 0);
+  gt[1].R = makeRotation(0.2, -0.5, 1.0, 0.6); gt[1].t = Eigen::Vector3d(1, -2, 0.5);
+  gt[2].R = makeRotation(0.7, 0.1, -0.3, 1.2); gt[2].t = Eigen::Vector3d(-1, 0.4, -1.5);
+  gt[3].R = makeRotation(-1, 0.3, 0.4, -0.9);  gt[3].t = Eigen::Vector3d(-0.5, 1.5, 2.0);
+
+  std::vector<std::pair<int, int>> edges = {{0, 1}, {1, 2}, {2, 3}, {0, 2}};
+  auto scene = buildScene(gt, edges, /*k_in=*/30, /*k_out=*/8);
+
+  // Caller supplies its own tree: a star centered at node 2 (skips the internal MST).
+  std::vector<std::pair<int, int>> tree = {{0, 2}, {1, 2}, {2, 3}};
+  auto res = teaser::alignMultiScanWithTree(scene.clouds, tree, scene.corr, makeParams(1e-3));
+
+  ASSERT_EQ(res.num_components, 1);
+  const int anchor = 2; // highest degree in the provided tree
+  EXPECT_TRUE(res.poses[anchor].R.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
+  EXPECT_LT(res.poses[anchor].t.norm(), 1e-9);
+
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_TRUE(res.valid[n]);
+    Eigen::Matrix3d R_rel = gt[anchor].R.transpose() * gt[n].R;
+    Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
+    EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
+    EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
+  }
 }
 
 // Degenerate input (too few correspondences) is reported as invalid.

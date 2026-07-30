@@ -147,17 +147,24 @@ struct MultiScanResult {
 /**
  * Align a set of overlapping scans into a common frame per connected component.
  *
- * Pipeline: build a maximum spanning tree over the adjacency graph (edge weight = number of
- * putative correspondences); split into connected components (a warning is emitted if there is
- * more than one); within each component pick the most-connected node as the anchor (identity
+ * Pipeline: build a maximum spanning tree over the adjacency graph using the caller-supplied
+ * edge weights; split into connected components (a warning is emitted if there is more than one);
+ * within each component pick the node with the largest total edge weight as the anchor (identity
  * pose) and propagate poses outward along the tree in topological order, aligning each child to
  * its single tree-parent via teaser::MultiviewSolver::solveNodePose.
+ *
+ * The MST edge weight is provided by the caller and is independent of the correspondences, so the
+ * tree can be chosen from any proxy (overlap, proximity, keypoint count, ...). Because propagation
+ * uses tree edges only, correspondences are consulted for tree edges only -- the caller may supply
+ * them for just those edges if the tree is known in advance.
  *
  * Correspondences are the raw putative matches (outliers included); the per-edge robust solve
  * performs its own inlier selection.
  *
  * @param clouds [in] clouds[i] is scan i (points in scan i's local frame)
  * @param adjacency [in] which scans overlap; vertices must be 0..clouds.size()-1
+ * @param edge_weights [in] MST edge weight keyed by (min(i,j), max(i,j)); adjacency edges absent
+ *        from the map are treated as weight 0
  * @param correspondences [in] keyed by (min(i,j), max(i,j)); each pair (a,b) is
  *        (index into cloud[min], index into cloud[max])
  * @param params [in] parameters forwarded to the per-node robust solve
@@ -165,6 +172,32 @@ struct MultiScanResult {
  */
 MultiScanResult alignMultiScan(
     const std::vector<teaser::PointCloud>& clouds, const teaser::Graph& adjacency,
+    const std::map<std::pair<int, int>, double>& edge_weights,
+    const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
+    const RobustRegistrationSolver::Params& params);
+
+/**
+ * Align a set of overlapping scans given a caller-provided spanning tree/forest (MST step skipped).
+ *
+ * Identical to alignMultiScan except that the propagation tree is supplied directly instead of
+ * being computed via a maximum spanning tree. Use this when the caller wants to choose the tree
+ * itself (e.g. its own MST, a chain, or a hand-picked topology). `tree_edges` are undirected
+ * `(i, j)` pairs; they should form a forest, but any extra edges are tolerated (a BFS spanning
+ * tree of the given edges is used). Connected components are derived from `tree_edges`, and each
+ * component's anchor is the node with the highest degree in the provided tree (ties -> smallest
+ * index). Everything else -- topological ordering, child-as-target alignment, and the returned
+ * gauge (per-component identity anchor) -- matches alignMultiScan.
+ *
+ * @param clouds [in] clouds[i] is scan i (points in scan i's local frame)
+ * @param tree_edges [in] undirected tree/forest edges over vertices 0..clouds.size()-1
+ * @param correspondences [in] keyed by (min(i,j), max(i,j)); each pair (a,b) is
+ *        (index into cloud[min], index into cloud[max])
+ * @param params [in] parameters forwarded to the per-node robust solve
+ * @return per-node global poses, validity, and component labeling
+ */
+MultiScanResult alignMultiScanWithTree(
+    const std::vector<teaser::PointCloud>& clouds,
+    const std::vector<std::pair<int, int>>& tree_edges,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
     const RobustRegistrationSolver::Params& params);
 
