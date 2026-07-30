@@ -52,6 +52,7 @@ add_library(teaser_registration
         src/certification.cc
         src/registration.cc
         src/graph.cc
+        src/multiview.cc
 )
 
 target_link_libraries(teaser_registration

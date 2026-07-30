@@ -175,6 +175,45 @@ You should be able to see Open3D windows showing registration results:
   - [Python](https://teaser.readthedocs.io/en/latest/api-python.html)
   - [MATLAB](https://teaser.readthedocs.io/en/latest/api-matlab.html)
 
+## Multi-scan alignment
+
+In addition to the pairwise solver, this fork provides an experimental driver for aligning **many**
+overlapping scans into a common frame. It is declared in `teaser/multiview.h` and lives entirely on
+top of the existing pairwise pipeline (the core solver is unchanged).
+
+```cpp
+teaser::MultiScanResult teaser::alignMultiScan(
+    const std::vector<teaser::PointCloud>& clouds,       // clouds[i] = scan i, in scan i's local frame
+    const teaser::Graph& adjacency,                      // which scans overlap (vertices 0..N-1)
+    const std::map<std::pair<int,int>,                   // per-edge putative correspondences, keyed by
+                   std::vector<std::pair<int,int>>>& correspondences,  //   (min(i,j),max(i,j))
+    const teaser::RobustRegistrationSolver::Params& params);
+```
+
+**Contract**
+
+- *Inputs.* One `PointCloud` per scan (points expressed in that scan's own local frame); an
+  adjacency graph marking which scans overlap; and, for each adjacency edge `(i,j)`,
+  the **raw putative** correspondences keyed by `(min(i,j), max(i,j))`, where each pair `(a,b)` is
+  `(index into cloud[min], index into cloud[max])`. Correspondences may contain outliers — the
+  per-edge robust solve performs its own inlier selection (scale-consistency + max-clique +
+  GNC-TLS). No feature matching is done for you.
+- *Assumptions.* Scale is fixed to `1` (rigid alignment). Adjacency vertices are `0..N-1`.
+- *What it does.* Builds a **maximum spanning tree** (edge weight = number of putative
+  correspondences), splits the graph into connected components (a warning is emitted if there is
+  more than one), picks the **most-connected node of each component as the anchor** (identity
+  pose), and propagates poses outward **along tree edges only**, in topological order, aligning
+  each child to its single already-posed parent.
+- *Output.* `MultiScanResult { poses, valid, component, num_components }` — one global pose
+  (`local → world`: `world = R·local + t`) per scan. Poses are **gauge-fixed per component**: each
+  component's anchor is the identity, so poses are only meaningful *relative to their component's
+  anchor*, and separate components live in unrelated frames. `valid[i]` is `false` for any scan
+  whose alignment failed or that was unreachable (e.g. its parent failed).
+- *Limitations.* Tree-only propagation (non-tree / loop-closure edges are not fused), no scale
+  estimation, and correspondences must be supplied by the caller.
+
+See `test/teaser/multiview-test.cc` for end-to-end usage.
+
 ## Other Publications
 Other publications related to TEASER include:
 - [H. Yang](http://hankyang.mit.edu/) and [L. Carlone](http://lucacarlone.mit.edu/), “A quaternion-based certifiably optimal solution to the Wahba problem with outliers,” in Proceedings of the IEEE International Conference on Computer Vision (ICCV), 2019, pp. 1665–1674. ([pdf](https://arxiv.org/pdf/1905.12536.pdf))

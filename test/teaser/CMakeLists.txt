@@ -11,6 +11,7 @@ set(TEST_SRCS
         rotation-solver-test.cc
         translation-solver-test.cc
         registration-test.cc
+        multiview-test.cc
         graph-test.cc
         certification-test.cc
         linalg-test.cc)
