@@ -331,7 +331,6 @@ TEST(MultiviewTest, MultiScanConnected) {
   const int anchor = 2;
   EXPECT_TRUE(res.poses[anchor].R.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
   EXPECT_LT(res.poses[anchor].t.norm(), 1e-9);
-  EXPECT_LT(res.residual_to_parent[anchor], 0.0); // anchor has no parent
 
   for (int n = 0; n < 4; ++n) {
     EXPECT_TRUE(res.valid[n]);
@@ -340,11 +339,13 @@ TEST(MultiviewTest, MultiScanConnected) {
     Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
     EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
     EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
-    if (n != anchor) {
-      // Non-anchor nodes report a small, non-negative mean residual to their tree-parent.
-      EXPECT_GE(res.residual_to_parent[n], 0.0);
-      EXPECT_LT(res.residual_to_parent[n], 1e-2);
-    }
+  }
+
+  // One residual entry per MST tree edge (n - 1 for a connected component), all small.
+  EXPECT_EQ(res.edge_residual.size(), 3u);
+  for (const auto& kv : res.edge_residual) {
+    EXPECT_GE(kv.second, 0.0);
+    EXPECT_LT(kv.second, 1e-2);
   }
 }
 
@@ -431,7 +432,6 @@ TEST(MultiviewTest, MultiScanWithGraphLoopClosure) {
   ASSERT_EQ(res.num_components, 1);
   const int anchor = 0; // all degree 2 -> tie -> smallest index
   EXPECT_TRUE(res.poses[anchor].R.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
-  EXPECT_LT(res.residual_to_parent[anchor], 0.0);
 
   for (int n = 0; n < 4; ++n) {
     EXPECT_TRUE(res.valid[n]);
@@ -439,10 +439,14 @@ TEST(MultiviewTest, MultiScanWithGraphLoopClosure) {
     Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
     EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
     EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
-    if (n != anchor) {
-      EXPECT_GE(res.residual_to_parent[n], 0.0);
-      EXPECT_LT(res.residual_to_parent[n], 1e-2);
-    }
+  }
+
+  // The graph keeps all edges (loop closure included): one residual entry per graph edge, all
+  // small. A multi-parent node contributes an entry for each of its incoming edges.
+  EXPECT_EQ(res.edge_residual.size(), 4u);
+  for (const auto& kv : res.edge_residual) {
+    EXPECT_GE(kv.second, 0.0);
+    EXPECT_LT(kv.second, 1e-2);
   }
 }
 

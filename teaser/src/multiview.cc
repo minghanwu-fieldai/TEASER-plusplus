@@ -224,7 +224,6 @@ teaser::MultiScanResult alignAlongGraph(
   result.poses.assign(N, teaser::Pose{});
   result.valid.assign(N, false);
   result.component.assign(N, -1);
-  result.residual_to_parent.assign(N, -1.0);
   if (N == 0) {
     return result;
   }
@@ -373,16 +372,16 @@ teaser::MultiScanResult alignAlongGraph(
       continue;
     }
 
-    // Fit quality: mean world-frame residual over inlier correspondences across all parent edges
+    // Per-edge fit quality: mean world-frame residual over each edge's inlier correspondences
     // (those consistent with the recovered pose within the noise bound).
     const double inlier_thresh = 2.0 * params.noise_bound * std::sqrt(std::max(0.0, params.cbar2));
     const teaser::Pose& child_pose = result.poses[node];
-    double residual_sum = 0.0;
-    int inlier_count = 0;
     for (const int p : used_parents) {
       const auto& corr = correspondences.at(edge_key(p, node));
       const bool parent_is_min = (p < node);
       const teaser::Pose& parent_pose = result.poses[p];
+      double residual_sum = 0.0;
+      int inlier_count = 0;
       for (const auto& c : corr) {
         const int p_idx = parent_is_min ? c.first : c.second;
         const int b_idx = parent_is_min ? c.second : c.first;
@@ -400,8 +399,8 @@ teaser::MultiScanResult alignAlongGraph(
           ++inlier_count;
         }
       }
+      result.edge_residual[edge_key(p, node)] = (inlier_count > 0) ? residual_sum / inlier_count : -1.0;
     }
-    result.residual_to_parent[node] = (inlier_count > 0) ? residual_sum / inlier_count : -1.0;
   }
 
   return result;

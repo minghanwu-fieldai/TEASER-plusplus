@@ -208,15 +208,16 @@ teaser::MultiScanResult teaser::alignMultiScan(
   and propagates poses outward **along tree edges only**, in topological order, aligning each child
   to its single already-posed parent. Because only tree edges are used, correspondences are
   consulted for tree edges only.
-- *Output.* `MultiScanResult { poses, valid, component, residual_to_parent, num_components }` — one
+- *Output.* `MultiScanResult { poses, valid, component, edge_residual, num_components }` — one
   global pose (`local → world`: `world = R·local + t`) per scan. Poses are **gauge-fixed per
   component**: each component's anchor is the identity, so poses are only meaningful *relative to
   their component's anchor*, and separate components live in unrelated frames. `valid[i]` is
   `false` for any scan whose alignment failed or that was unreachable (e.g. its parent failed).
-  `residual_to_parent[i]` is a per-edge fit-quality metric: the **mean world-frame residual** of
-  the edge linking scan `i` to its tree-parent, averaged over that edge's inlier correspondences
-  (those consistent with the recovered pose within the noise bound). It is `-1` for component
-  anchors (no parent), for failed scans, and when no inliers remain.
+  `edge_residual` is a per-edge fit-quality map keyed by `(min(i,j), max(i,j))`: for each edge
+  actually used during alignment, the **mean world-frame residual** over that edge's inlier
+  correspondences (those consistent with the recovered pose within the noise bound). A multi-parent
+  node contributes one entry per incoming edge; the value is `-1` for a used edge with no inliers,
+  and edges that were not used (pruned by the MST path, or touching an unaligned node) have no entry.
 - *Limitations.* This MST path uses tree-only propagation (non-tree / loop-closure edges are not
   fused — see `alignMultiScanWithGraph` below to keep them), no scale estimation, and both the edge
   weights and correspondences must be supplied by the caller.
@@ -230,8 +231,8 @@ highest-degree node of each component (ties → smallest index) is the anchor/ro
 that root assigns a discovery order used to orient every edge from the earlier-discovered endpoint
 (parent) to the later one (child). Because that orientation follows a total order it is always
 acyclic, so **loop-closure edges are kept, not pruned**: a node with several in-edges is aligned to
-all of its already-posed parents at once (the multi-edge aggregation from `multiview.md`), and its
-`residual_to_parent` is then averaged over the inliers of all those edges. Any node with no edges
+all of its already-posed parents at once (the multi-edge aggregation from `multiview.md`), and each
+of those edges gets its own entry in `edge_residual`. Any node with no edges
 becomes its own single-node component with the identity pose. The per-component identity gauge and
 child-as-target convention are the same as the MST path.
 
