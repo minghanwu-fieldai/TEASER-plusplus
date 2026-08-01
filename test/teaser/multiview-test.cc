@@ -397,7 +397,7 @@ TEST(MultiviewTest, MultiScanWithCallerTree) {
 
   // Caller supplies its own tree: a star centered at node 2 (skips the internal MST).
   std::vector<std::pair<int, int>> tree = {{0, 2}, {1, 2}, {2, 3}};
-  auto res = teaser::alignMultiScanWithTree(scene.clouds, tree, scene.corr, makeParams(1e-3));
+  auto res = teaser::alignMultiScanWithGraph(scene.clouds, tree, scene.corr, makeParams(1e-3));
 
   ASSERT_EQ(res.num_components, 1);
   const int anchor = 2; // highest degree in the provided tree
@@ -410,6 +410,39 @@ TEST(MultiviewTest, MultiScanWithCallerTree) {
     Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
     EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
     EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
+  }
+}
+
+// Caller graph with a loop closure (cycle): nodes with multiple in-edges are aligned to all of
+// their already-posed parents, and every pose is still recovered.
+TEST(MultiviewTest, MultiScanWithGraphLoopClosure) {
+  std::vector<teaser::Pose> gt(4);
+  gt[0].R = makeRotation(1, 0, 0, 0.0);        gt[0].t = Eigen::Vector3d(0, 0, 0);
+  gt[1].R = makeRotation(0.2, -0.5, 1.0, 0.6); gt[1].t = Eigen::Vector3d(1, -2, 0.5);
+  gt[2].R = makeRotation(0.7, 0.1, -0.3, 1.2); gt[2].t = Eigen::Vector3d(-1, 0.4, -1.5);
+  gt[3].R = makeRotation(-1, 0.3, 0.4, -0.9);  gt[3].t = Eigen::Vector3d(-0.5, 1.5, 2.0);
+
+  // 4-cycle: with anchor 0, node 2 is reached with two parents (1 and 3).
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {3, 0}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/5);
+
+  auto res = teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3));
+
+  ASSERT_EQ(res.num_components, 1);
+  const int anchor = 0; // all degree 2 -> tie -> smallest index
+  EXPECT_TRUE(res.poses[anchor].R.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
+  EXPECT_LT(res.residual_to_parent[anchor], 0.0);
+
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_TRUE(res.valid[n]);
+    Eigen::Matrix3d R_rel = gt[anchor].R.transpose() * gt[n].R;
+    Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
+    EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
+    EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
+    if (n != anchor) {
+      EXPECT_GE(res.residual_to_parent[n], 0.0);
+      EXPECT_LT(res.residual_to_parent[n], 1e-2);
+    }
   }
 }
 

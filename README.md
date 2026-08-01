@@ -217,20 +217,23 @@ teaser::MultiScanResult teaser::alignMultiScan(
   the edge linking scan `i` to its tree-parent, averaged over that edge's inlier correspondences
   (those consistent with the recovered pose within the noise bound). It is `-1` for component
   anchors (no parent), for failed scans, and when no inliers remain.
-- *Limitations.* Tree-only propagation (non-tree / loop-closure edges are not fused), no scale
-  estimation, and both the edge weights and correspondences must be supplied by the caller.
+- *Limitations.* This MST path uses tree-only propagation (non-tree / loop-closure edges are not
+  fused — see `alignMultiScanWithGraph` below to keep them), no scale estimation, and both the edge
+  weights and correspondences must be supplied by the caller.
 
-**Bring your own tree.** If you would rather compute the spanning tree yourself, call
-`teaser::alignMultiScanWithTree(clouds, tree_edges, correspondences, params)` instead — it skips
-the MST step and propagates over the `tree_edges` you provide (undirected `(i,j)` pairs; the
-anchor of each component is the highest-degree node in your tree). Everything else — topological
-ordering, child-as-target alignment, and the per-component identity gauge — is identical.
-
-The given edges are treated as a forest: connected components are derived from them (a warning is
-still emitted if there is more than one), and any node not covered by an edge becomes its own
-single-node component with the identity pose. Extra edges that would create a cycle are tolerated —
-a BFS spanning tree of the supplied edges is used, so redundant edges are simply ignored rather
-than causing an error.
+**Bring your own graph.** If you would rather supply the topology yourself, call
+`teaser::alignMultiScanWithGraph(clouds, graph_edges, correspondences, params)` instead — it skips
+the MST step and works over the `graph_edges` you provide (undirected `(i,j)` pairs, duplicates
+ignored). Unlike the MST path, **it respects the whole graph, tree or not**: connected components
+are derived from the edges (a warning is still emitted if there is more than one), the
+highest-degree node of each component (ties → smallest index) is the anchor/root, and a BFS from
+that root assigns a discovery order used to orient every edge from the earlier-discovered endpoint
+(parent) to the later one (child). Because that orientation follows a total order it is always
+acyclic, so **loop-closure edges are kept, not pruned**: a node with several in-edges is aligned to
+all of its already-posed parents at once (the multi-edge aggregation from `multiview.md`), and its
+`residual_to_parent` is then averaged over the inliers of all those edges. Any node with no edges
+becomes its own single-node component with the identity pose. The per-component identity gauge and
+child-as-target convention are the same as the MST path.
 
 See `test/teaser/multiview-test.cc` for end-to-end usage.
 

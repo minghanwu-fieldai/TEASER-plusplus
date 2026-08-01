@@ -16,6 +16,7 @@
 #include <map>
 #include <numeric>
 #include <queue>
+#include <set>
 #include <utility>
 
 #include "teaser/registration.h"
@@ -178,13 +179,44 @@ teaser::MultiviewSolver::solveNodePose(const std::vector<teaser::NeighborEdge>& 
 
 namespace {
 
-// Shared core of the multi-scan drivers. Given a set of undirected tree/forest edges and a
-// per-node anchor score, split into connected components (warning if more than one), pick each
-// component's anchor (max score, ties -> smallest index) as the identity pose, and propagate poses
-// outward along the tree in topological order (child = target, parent = fixed source).
-teaser::MultiScanResult alignAlongForest(
+// Build a NeighborEdge aligning `child` (target/dst) to an already-posed `parent` (fixed source)
+// over their shared correspondences. Returns false if no usable correspondence columns remain.
+bool buildNeighborEdge(const std::vector<teaser::PointCloud>& clouds,
+                       const std::vector<std::pair<int, int>>& corr, int parent, int child,
+                       const teaser::Pose& parent_pose, teaser::NeighborEdge* edge) {
+  const bool parent_is_min = (parent < child);
+  edge->R_i = parent_pose.R;
+  edge->t_i = parent_pose.t;
+  edge->src.resize(3, static_cast<Eigen::Index>(corr.size()));
+  edge->dst.resize(3, static_cast<Eigen::Index>(corr.size()));
+  Eigen::Index col = 0;
+  for (const auto& c : corr) {
+    const int p_idx = parent_is_min ? c.first : c.second;  // index into parent cloud
+    const int b_idx = parent_is_min ? c.second : c.first;  // index into child cloud
+    if (p_idx < 0 || p_idx >= static_cast<int>(clouds[parent].size()) || b_idx < 0 ||
+        b_idx >= static_cast<int>(clouds[child].size())) {
+      continue; // skip malformed correspondence
+    }
+    const auto& pp = clouds[parent][p_idx];
+    const auto& bp = clouds[child][b_idx];
+    edge->src.col(col) << pp.x, pp.y, pp.z;
+    edge->dst.col(col) << bp.x, bp.y, bp.z;
+    ++col;
+  }
+  edge->src.conservativeResize(3, col);
+  edge->dst.conservativeResize(3, col);
+  return col > 0;
+}
+
+// Shared core of the multi-scan drivers. Given a set of undirected graph edges (a tree, forest, or
+// general graph) and a per-node anchor score, split into connected components (warning if more than
+// one), pick each component's anchor (max score, ties -> smallest index) as the identity pose, root
+// each component at its anchor via BFS to orient every edge (parent = discovered earlier), and
+// propagate poses in topological order, aligning each node to ALL of its already-posed parents
+// (child = target, parents = fixed sources).
+teaser::MultiScanResult alignAlongGraph(
     const std::vector<teaser::PointCloud>& clouds,
-    const std::vector<std::pair<int, int>>& forest_edges, const std::vector<double>& anchor_score,
+    const std::vector<std::pair<int, int>>& graph_edges, const std::vector<double>& anchor_score,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
     const teaser::RobustRegistrationSolver::Params& params) {
   const int N = static_cast<int>(clouds.size());
@@ -202,7 +234,7 @@ teaser::MultiScanResult alignAlongForest(
     return e.first >= 0 && e.second >= 0 && e.first < N && e.second < N && e.first != e.second;
   };
 
-  // Connected components via union-find over the forest edges.
+  // Deduplicated undirected adjacency + union-find components over the graph edges.
   std::vector<int> uf(N);
   std::iota(uf.begin(), uf.end(), 0);
   auto find = [&uf](int x) {
@@ -212,12 +244,20 @@ teaser::MultiScanResult alignAlongForest(
     }
     return x;
   };
-  for (const auto& e : forest_edges) {
+  std::vector<std::vector<int>> adj(N);
+  std::set<std::pair<int, int>> edges;
+  for (const auto& e : graph_edges) {
     if (!valid_edge(e)) {
       continue;
     }
-    const int ra = find(e.first);
-    const int rb = find(e.second);
+    const auto k = edge_key(e.first, e.second);
+    if (!edges.insert(k).second) {
+      continue; // drop duplicate / parallel edges
+    }
+    adj[k.first].push_back(k.second);
+    adj[k.second].push_back(k.first);
+    const int ra = find(k.first);
+    const int rb = find(k.second);
     if (ra != rb) {
       uf[rb] = ra;
     }
@@ -247,38 +287,43 @@ teaser::MultiScanResult alignAlongForest(
     }
   }
 
-  // Root each tree at its anchor (BFS), orient parent->child, then topological order.
-  std::vector<std::vector<int>> tree_adj(N);
-  for (const auto& e : forest_edges) {
-    if (!valid_edge(e)) {
-      continue;
-    }
-    tree_adj[e.first].push_back(e.second);
-    tree_adj[e.second].push_back(e.first);
-  }
-  std::vector<int> tree_parent(N, -1);
-  std::vector<std::pair<int, int>> directed;
-  std::vector<char> visited(N, 0);
-  for (int c = 0; c < result.num_components; ++c) {
-    const int root = anchor[c];
-    if (root < 0 || visited[root]) {
-      continue;
-    }
-    std::queue<int> q;
-    q.push(root);
-    visited[root] = 1;
-    while (!q.empty()) {
-      const int u = q.front();
-      q.pop();
-      for (const int v : tree_adj[u]) {
-        if (!visited[v]) {
-          visited[v] = 1;
-          tree_parent[v] = u;
-          directed.push_back({u, v});
-          q.push(v);
+  // BFS from each anchor to assign a discovery order over the graph.
+  std::vector<int> disc(N, -1);
+  {
+    int counter = 0;
+    std::vector<char> visited(N, 0);
+    for (int c = 0; c < result.num_components; ++c) {
+      const int root = anchor[c];
+      if (root < 0 || visited[root]) {
+        continue;
+      }
+      std::queue<int> q;
+      q.push(root);
+      visited[root] = 1;
+      disc[root] = counter++;
+      while (!q.empty()) {
+        const int u = q.front();
+        q.pop();
+        for (const int v : adj[u]) {
+          if (!visited[v]) {
+            visited[v] = 1;
+            disc[v] = counter++;
+            q.push(v);
+          }
         }
       }
     }
+  }
+
+  // Orient every edge by discovery order (parent = discovered earlier). Since discovery order is a
+  // total order, this is acyclic even if the input graph has cycles. Record each node's parents.
+  std::vector<std::vector<int>> parents(N);
+  std::vector<std::pair<int, int>> directed;
+  for (const auto& k : edges) {
+    const int parent = (disc[k.first] < disc[k.second]) ? k.first : k.second;
+    const int child = (parent == k.first) ? k.second : k.first;
+    parents[child].push_back(parent);
+    directed.push_back({parent, child});
   }
   const std::vector<int> order = teaser::topologicalSort(N, directed);
 
@@ -290,53 +335,36 @@ teaser::MultiScanResult alignAlongForest(
     }
   }
 
-  // Propagate poses along the tree in topological order.
+  // Propagate poses in topological order, aligning each node to all of its already-posed parents.
   teaser::MultiviewSolver solver(params);
   for (const int node : order) {
-    const int p = tree_parent[node];
-    if (p < 0) {
+    if (parents[node].empty()) {
       continue; // anchor/root or isolated singleton (already identity)
     }
-    if (!result.valid[p]) {
-      std::cerr << "[teaser::multiview] Warning: node " << node << " skipped (parent " << p
-                << " has no valid pose).\n";
-      result.valid[node] = false;
-      continue;
-    }
-    const auto it = correspondences.find(edge_key(p, node));
-    if (it == correspondences.end() || it->second.empty()) {
-      std::cerr << "[teaser::multiview] Warning: node " << node
-                << " skipped (no correspondences on tree edge to parent " << p << ").\n";
-      result.valid[node] = false;
-      continue;
-    }
-    const auto& corr = it->second;
-    const bool parent_is_min = (p < node);
-
-    // Build one NeighborEdge: parent = source (fixed pose), child (node) = target/dst.
-    teaser::NeighborEdge edge;
-    edge.R_i = result.poses[p].R;
-    edge.t_i = result.poses[p].t;
-    edge.src.resize(3, static_cast<Eigen::Index>(corr.size()));
-    edge.dst.resize(3, static_cast<Eigen::Index>(corr.size()));
-    Eigen::Index col = 0;
-    for (const auto& c : corr) {
-      const int p_idx = parent_is_min ? c.first : c.second;  // index into parent cloud
-      const int b_idx = parent_is_min ? c.second : c.first;  // index into child cloud
-      if (p_idx < 0 || p_idx >= static_cast<int>(clouds[p].size()) || b_idx < 0 ||
-          b_idx >= static_cast<int>(clouds[node].size())) {
-        continue; // skip malformed correspondence
+    std::vector<teaser::NeighborEdge> node_edges;
+    std::vector<int> used_parents;
+    for (const int p : parents[node]) {
+      if (!result.valid[p]) {
+        continue; // parent has no usable pose
       }
-      const auto& pp = clouds[p][p_idx];
-      const auto& bp = clouds[node][b_idx];
-      edge.src.col(col) << pp.x, pp.y, pp.z;
-      edge.dst.col(col) << bp.x, bp.y, bp.z;
-      ++col;
+      const auto it = correspondences.find(edge_key(p, node));
+      if (it == correspondences.end() || it->second.empty()) {
+        continue;
+      }
+      teaser::NeighborEdge edge;
+      if (buildNeighborEdge(clouds, it->second, p, node, result.poses[p], &edge)) {
+        node_edges.push_back(std::move(edge));
+        used_parents.push_back(p);
+      }
     }
-    edge.src.conservativeResize(3, col);
-    edge.dst.conservativeResize(3, col);
+    if (node_edges.empty()) {
+      std::cerr << "[teaser::multiview] Warning: node " << node
+                << " skipped (no usable parent edges).\n";
+      result.valid[node] = false;
+      continue;
+    }
 
-    const teaser::RegistrationSolution sol = solver.solveNodePose({edge});
+    const teaser::RegistrationSolution sol = solver.solveNodePose(node_edges);
     result.poses[node].R = sol.rotation;
     result.poses[node].t = sol.translation;
     result.valid[node] = sol.valid;
@@ -345,28 +373,32 @@ teaser::MultiScanResult alignAlongForest(
       continue;
     }
 
-    // Per-edge fit quality: mean world-frame residual over inlier correspondences (those consistent
-    // with the recovered pose within the noise bound).
-    const teaser::Pose& parent_pose = result.poses[p];
-    const teaser::Pose& child_pose = result.poses[node];
+    // Fit quality: mean world-frame residual over inlier correspondences across all parent edges
+    // (those consistent with the recovered pose within the noise bound).
     const double inlier_thresh = 2.0 * params.noise_bound * std::sqrt(std::max(0.0, params.cbar2));
+    const teaser::Pose& child_pose = result.poses[node];
     double residual_sum = 0.0;
     int inlier_count = 0;
-    for (const auto& c : corr) {
-      const int p_idx = parent_is_min ? c.first : c.second;
-      const int b_idx = parent_is_min ? c.second : c.first;
-      if (p_idx < 0 || p_idx >= static_cast<int>(clouds[p].size()) || b_idx < 0 ||
-          b_idx >= static_cast<int>(clouds[node].size())) {
-        continue;
-      }
-      const auto& pp = clouds[p][p_idx];
-      const auto& bp = clouds[node][b_idx];
-      const Eigen::Vector3d wp = parent_pose.R * Eigen::Vector3d(pp.x, pp.y, pp.z) + parent_pose.t;
-      const Eigen::Vector3d wb = child_pose.R * Eigen::Vector3d(bp.x, bp.y, bp.z) + child_pose.t;
-      const double r = (wp - wb).norm();
-      if (r <= inlier_thresh) {
-        residual_sum += r;
-        ++inlier_count;
+    for (const int p : used_parents) {
+      const auto& corr = correspondences.at(edge_key(p, node));
+      const bool parent_is_min = (p < node);
+      const teaser::Pose& parent_pose = result.poses[p];
+      for (const auto& c : corr) {
+        const int p_idx = parent_is_min ? c.first : c.second;
+        const int b_idx = parent_is_min ? c.second : c.first;
+        if (p_idx < 0 || p_idx >= static_cast<int>(clouds[p].size()) || b_idx < 0 ||
+            b_idx >= static_cast<int>(clouds[node].size())) {
+          continue;
+        }
+        const auto& pp = clouds[p][p_idx];
+        const auto& bp = clouds[node][b_idx];
+        const Eigen::Vector3d wp = parent_pose.R * Eigen::Vector3d(pp.x, pp.y, pp.z) + parent_pose.t;
+        const Eigen::Vector3d wb = child_pose.R * Eigen::Vector3d(bp.x, bp.y, bp.z) + child_pose.t;
+        const double r = (wp - wb).norm();
+        if (r <= inlier_thresh) {
+          residual_sum += r;
+          ++inlier_count;
+        }
       }
     }
     result.residual_to_parent[node] = (inlier_count > 0) ? residual_sum / inlier_count : -1.0;
@@ -422,18 +454,18 @@ teaser::MultiScanResult teaser::alignMultiScan(
     anchor_score[e.v] += e.weight;
   }
 
-  return alignAlongForest(clouds, forest_edges, anchor_score, correspondences, params);
+  return alignAlongGraph(clouds, forest_edges, anchor_score, correspondences, params);
 }
 
-teaser::MultiScanResult teaser::alignMultiScanWithTree(
+teaser::MultiScanResult teaser::alignMultiScanWithGraph(
     const std::vector<teaser::PointCloud>& clouds,
-    const std::vector<std::pair<int, int>>& tree_edges,
+    const std::vector<std::pair<int, int>>& graph_edges,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
     const teaser::RobustRegistrationSolver::Params& params) {
   const int N = static_cast<int>(clouds.size());
-  // Score anchors by tree degree: the most-connected node in the caller-provided tree.
+  // Score anchors by degree: the most-connected node in the caller-provided graph is the root.
   std::vector<double> anchor_score(N, 0.0);
-  for (const auto& e : tree_edges) {
+  for (const auto& e : graph_edges) {
     if (e.first >= 0 && e.first < N) {
       anchor_score[e.first] += 1.0;
     }
@@ -441,5 +473,5 @@ teaser::MultiScanResult teaser::alignMultiScanWithTree(
       anchor_score[e.second] += 1.0;
     }
   }
-  return alignAlongForest(clouds, tree_edges, anchor_score, correspondences, params);
+  return alignAlongGraph(clouds, graph_edges, anchor_score, correspondences, params);
 }

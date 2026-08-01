@@ -141,10 +141,12 @@ struct MultiScanResult {
   /** Connected-component id per node (nodes in the same component share a gauge). */
   std::vector<int> component;
   /**
-   * Mean world-frame residual of the edge that connects each node to its tree-parent, averaged
-   * over the inlier correspondences of that edge (those whose post-alignment residual is within the
-   * noise bound). This is a per-edge fit-quality metric. It is negative (-1) for component anchors
-   * (which have no parent), for nodes whose alignment failed, and when no inliers remain.
+   * Mean world-frame residual of the edge(s) connecting each node to its already-posed parent(s),
+   * averaged over the inlier correspondences (those whose post-alignment residual is within the
+   * noise bound) across all of the node's parent edges. This is a per-node fit-quality metric; with
+   * tree-based paths each node has a single parent, while the graph path may aggregate several. It
+   * is negative (-1) for component anchors (which have no parent), for nodes whose alignment failed,
+   * and when no inliers remain.
    */
   std::vector<double> residual_to_parent;
   /** Number of connected components found in the adjacency graph. */
@@ -184,27 +186,29 @@ MultiScanResult alignMultiScan(
     const RobustRegistrationSolver::Params& params);
 
 /**
- * Align a set of overlapping scans given a caller-provided spanning tree/forest (MST step skipped).
+ * Align a set of overlapping scans given a caller-provided graph (MST step skipped).
  *
- * Identical to alignMultiScan except that the propagation tree is supplied directly instead of
- * being computed via a maximum spanning tree. Use this when the caller wants to choose the tree
- * itself (e.g. its own MST, a chain, or a hand-picked topology). `tree_edges` are undirected
- * `(i, j)` pairs; they should form a forest, but any extra edges are tolerated (a BFS spanning
- * tree of the given edges is used). Connected components are derived from `tree_edges`, and each
- * component's anchor is the node with the highest degree in the provided tree (ties -> smallest
- * index). Everything else -- topological ordering, child-as-target alignment, and the returned
- * gauge (per-component identity anchor) -- matches alignMultiScan.
+ * Identical to alignMultiScan except that the graph is supplied directly instead of being computed
+ * via a maximum spanning tree. The graph may or may not be a tree: `graph_edges` are undirected
+ * `(i, j)` pairs (duplicates ignored). Connected components are derived from the edges, and each
+ * component's anchor (its root) is the highest-degree node (ties -> smallest index). The root is
+ * used to run a BFS that assigns a discovery order; every edge is then oriented from the
+ * earlier-discovered endpoint (parent) to the later one (child). Because that orientation follows a
+ * total order it is always acyclic, so loop-closure edges are kept rather than pruned: a node with
+ * several in-edges is aligned to ALL of its already-posed parents at once (the multi-edge
+ * aggregation from multiview.md). The returned gauge (per-component identity anchor) matches
+ * alignMultiScan.
  *
  * @param clouds [in] clouds[i] is scan i (points in scan i's local frame)
- * @param tree_edges [in] undirected tree/forest edges over vertices 0..clouds.size()-1
+ * @param graph_edges [in] undirected graph edges over vertices 0..clouds.size()-1 (tree or not)
  * @param correspondences [in] keyed by (min(i,j), max(i,j)); each pair (a,b) is
  *        (index into cloud[min], index into cloud[max])
  * @param params [in] parameters forwarded to the per-node robust solve
  * @return per-node global poses, validity, and component labeling
  */
-MultiScanResult alignMultiScanWithTree(
+MultiScanResult alignMultiScanWithGraph(
     const std::vector<teaser::PointCloud>& clouds,
-    const std::vector<std::pair<int, int>>& tree_edges,
+    const std::vector<std::pair<int, int>>& graph_edges,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
     const RobustRegistrationSolver::Params& params);
 
