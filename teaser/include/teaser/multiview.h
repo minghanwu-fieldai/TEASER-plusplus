@@ -140,6 +140,13 @@ struct MultiScanResult {
   std::vector<bool> valid;
   /** Connected-component id per node (nodes in the same component share a gauge). */
   std::vector<int> component;
+  /**
+   * Mean world-frame residual of the edge that connects each node to its tree-parent, averaged
+   * over the inlier correspondences of that edge (those whose post-alignment residual is within the
+   * noise bound). This is a per-edge fit-quality metric. It is negative (-1) for component anchors
+   * (which have no parent), for nodes whose alignment failed, and when no inliers remain.
+   */
+  std::vector<double> residual_to_parent;
   /** Number of connected components found in the adjacency graph. */
   int num_components = 0;
 };

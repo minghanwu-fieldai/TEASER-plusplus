@@ -331,6 +331,7 @@ TEST(MultiviewTest, MultiScanConnected) {
   const int anchor = 2;
   EXPECT_TRUE(res.poses[anchor].R.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
   EXPECT_LT(res.poses[anchor].t.norm(), 1e-9);
+  EXPECT_LT(res.residual_to_parent[anchor], 0.0); // anchor has no parent
 
   for (int n = 0; n < 4; ++n) {
     EXPECT_TRUE(res.valid[n]);
@@ -339,6 +340,11 @@ TEST(MultiviewTest, MultiScanConnected) {
     Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
     EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
     EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
+    if (n != anchor) {
+      // Non-anchor nodes report a small, non-negative mean residual to their tree-parent.
+      EXPECT_GE(res.residual_to_parent[n], 0.0);
+      EXPECT_LT(res.residual_to_parent[n], 1e-2);
+    }
   }
 }
 

@@ -208,11 +208,15 @@ teaser::MultiScanResult teaser::alignMultiScan(
   and propagates poses outward **along tree edges only**, in topological order, aligning each child
   to its single already-posed parent. Because only tree edges are used, correspondences are
   consulted for tree edges only.
-- *Output.* `MultiScanResult { poses, valid, component, num_components }` — one global pose
-  (`local → world`: `world = R·local + t`) per scan. Poses are **gauge-fixed per component**: each
-  component's anchor is the identity, so poses are only meaningful *relative to their component's
-  anchor*, and separate components live in unrelated frames. `valid[i]` is `false` for any scan
-  whose alignment failed or that was unreachable (e.g. its parent failed).
+- *Output.* `MultiScanResult { poses, valid, component, residual_to_parent, num_components }` — one
+  global pose (`local → world`: `world = R·local + t`) per scan. Poses are **gauge-fixed per
+  component**: each component's anchor is the identity, so poses are only meaningful *relative to
+  their component's anchor*, and separate components live in unrelated frames. `valid[i]` is
+  `false` for any scan whose alignment failed or that was unreachable (e.g. its parent failed).
+  `residual_to_parent[i]` is a per-edge fit-quality metric: the **mean world-frame residual** of
+  the edge linking scan `i` to its tree-parent, averaged over that edge's inlier correspondences
+  (those consistent with the recovered pose within the noise bound). It is `-1` for component
+  anchors (no parent), for failed scans, and when no inliers remain.
 - *Limitations.* Tree-only propagation (non-tree / loop-closure edges are not fused), no scale
   estimation, and both the edge weights and correspondences must be supplied by the caller.
 

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -191,6 +192,7 @@ teaser::MultiScanResult alignAlongForest(
   result.poses.assign(N, teaser::Pose{});
   result.valid.assign(N, false);
   result.component.assign(N, -1);
+  result.residual_to_parent.assign(N, -1.0);
   if (N == 0) {
     return result;
   }
@@ -340,7 +342,34 @@ teaser::MultiScanResult alignAlongForest(
     result.valid[node] = sol.valid;
     if (!sol.valid) {
       std::cerr << "[teaser::multiview] Warning: alignment failed for node " << node << ".\n";
+      continue;
     }
+
+    // Per-edge fit quality: mean world-frame residual over inlier correspondences (those consistent
+    // with the recovered pose within the noise bound).
+    const teaser::Pose& parent_pose = result.poses[p];
+    const teaser::Pose& child_pose = result.poses[node];
+    const double inlier_thresh = 2.0 * params.noise_bound * std::sqrt(std::max(0.0, params.cbar2));
+    double residual_sum = 0.0;
+    int inlier_count = 0;
+    for (const auto& c : corr) {
+      const int p_idx = parent_is_min ? c.first : c.second;
+      const int b_idx = parent_is_min ? c.second : c.first;
+      if (p_idx < 0 || p_idx >= static_cast<int>(clouds[p].size()) || b_idx < 0 ||
+          b_idx >= static_cast<int>(clouds[node].size())) {
+        continue;
+      }
+      const auto& pp = clouds[p][p_idx];
+      const auto& bp = clouds[node][b_idx];
+      const Eigen::Vector3d wp = parent_pose.R * Eigen::Vector3d(pp.x, pp.y, pp.z) + parent_pose.t;
+      const Eigen::Vector3d wb = child_pose.R * Eigen::Vector3d(bp.x, bp.y, bp.z) + child_pose.t;
+      const double r = (wp - wb).norm();
+      if (r <= inlier_thresh) {
+        residual_sum += r;
+        ++inlier_count;
+      }
+    }
+    result.residual_to_parent[node] = (inlier_count > 0) ? residual_sum / inlier_count : -1.0;
   }
 
   return result;
