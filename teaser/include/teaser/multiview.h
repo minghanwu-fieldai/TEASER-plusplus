@@ -82,6 +82,8 @@ struct NeighborEdge {
   Eigen::Matrix<double, 3, Eigen::Dynamic> src;
   /** Node-local target points, 3-by-K_i (column i <-> src column i). */
   Eigen::Matrix<double, 3, Eigen::Dynamic> dst;
+  /** Weight applied to every correspondence of this edge in the aggregated TLS (default 1). */
+  double weight = 1.0;
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
@@ -199,17 +201,32 @@ MultiScanResult alignMultiScan(
  * aggregation from multiview.md). The returned gauge (per-component identity anchor) matches
  * alignMultiScan.
  *
+ * Optionally the caller can pass `order`, a topological order of the scans (root-most first). When
+ * non-empty it replaces the automatic reference: it decides each component's anchor (the earliest
+ * listed node in the component), the edge directions (earlier in the order = parent), and the order
+ * in which nodes are aligned. Nodes absent from a non-empty `order` are ranked after all listed
+ * ones. A node whose neighbors are all later in the order is still aligned once one of them is posed
+ * (BFS fallback), so an order inconsistent with the graph never leaves nodes unaligned.
+ *
  * @param clouds [in] clouds[i] is scan i (points in scan i's local frame)
  * @param graph_edges [in] undirected graph edges over vertices 0..clouds.size()-1 (tree or not)
  * @param correspondences [in] keyed by (min(i,j), max(i,j)); each pair (a,b) is
  *        (index into cloud[min], index into cloud[max])
+ * Optionally the caller can pass `edge_weights`, one weight per entry of `graph_edges`. Edge `i`'s
+ * weight scales every one of its correspondences in the aggregated rotation and translation TLS
+ * costs. Empty = all edges weight 1. NOTE: the weight scales the cost among the max-clique inliers;
+ * it does not influence max-clique inlier selection or the scale-consistency prune.
+ *
  * @param params [in] parameters forwarded to the per-node robust solve
+ * @param order [in] optional topological order of node indices (root-most first); empty = auto
+ * @param edge_weights [in] optional per-edge weights aligned with `graph_edges`; empty = unweighted
  * @return per-node global poses, validity, and component labeling
  */
 MultiScanResult alignMultiScanWithGraph(
     const std::vector<teaser::PointCloud>& clouds,
     const std::vector<std::pair<int, int>>& graph_edges,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
-    const RobustRegistrationSolver::Params& params);
+    const RobustRegistrationSolver::Params& params, const std::vector<int>& order = {},
+    const std::vector<double>& edge_weights = {});
 
 } // namespace teaser

@@ -450,6 +450,138 @@ TEST(MultiviewTest, MultiScanWithGraphLoopClosure) {
   }
 }
 
+// A caller-provided order overrides the anchor and the DAG direction.
+TEST(MultiviewTest, MultiScanWithGraphOrder) {
+  std::vector<teaser::Pose> gt(4);
+  gt[0].R = makeRotation(1, 0, 0, 0.0);        gt[0].t = Eigen::Vector3d(0, 0, 0);
+  gt[1].R = makeRotation(0.2, -0.5, 1.0, 0.6); gt[1].t = Eigen::Vector3d(1, -2, 0.5);
+  gt[2].R = makeRotation(0.7, 0.1, -0.3, 1.2); gt[2].t = Eigen::Vector3d(-1, 0.4, -1.5);
+  gt[3].R = makeRotation(-1, 0.3, 0.4, -0.9);  gt[3].t = Eigen::Vector3d(-0.5, 1.5, 2.0);
+
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {3, 0}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/5);
+
+  // Default anchor would be node 0; the order makes node 3 the root instead.
+  std::vector<int> order = {3, 2, 1, 0};
+  auto res =
+      teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3), order);
+
+  ASSERT_EQ(res.num_components, 1);
+  const int anchor = 3; // earliest in the order
+  EXPECT_TRUE(res.poses[anchor].R.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
+  EXPECT_LT(res.poses[anchor].t.norm(), 1e-9);
+
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_TRUE(res.valid[n]);
+    Eigen::Matrix3d R_rel = gt[anchor].R.transpose() * gt[n].R;
+    Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
+    EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
+    EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
+  }
+}
+
+// BFS fallback: a node whose only neighbor comes later in the order is still aligned.
+TEST(MultiviewTest, MultiScanWithGraphOrderFallback) {
+  std::vector<teaser::Pose> gt(3);
+  gt[0].R = makeRotation(1, 0, 0, 0.0);        gt[0].t = Eigen::Vector3d(0, 0, 0);
+  gt[1].R = makeRotation(0.2, -0.5, 1.0, 0.6); gt[1].t = Eigen::Vector3d(1, -2, 0.5);
+  gt[2].R = makeRotation(0.7, 0.1, -0.3, 1.2); gt[2].t = Eigen::Vector3d(-1, 0.4, -1.5);
+
+  // Star centered at node 2. With order {0,1,2}, node 1's only neighbor (2) comes later, so it must
+  // be picked up on a second sweep after node 2 is posed.
+  std::vector<std::pair<int, int>> graph = {{0, 2}, {1, 2}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/5);
+
+  std::vector<int> order = {0, 1, 2};
+  auto res =
+      teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3), order);
+
+  ASSERT_EQ(res.num_components, 1);
+  const int anchor = 0; // earliest in the order
+  EXPECT_TRUE(res.poses[anchor].R.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
+
+  for (int n = 0; n < 3; ++n) {
+    EXPECT_TRUE(res.valid[n]); // node 1 recovered via the fallback
+    Eigen::Matrix3d R_rel = gt[anchor].R.transpose() * gt[n].R;
+    Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
+    EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
+    EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
+  }
+}
+
+namespace {
+std::vector<teaser::Pose> fourPoseGt() {
+  std::vector<teaser::Pose> gt(4);
+  gt[0].R = makeRotation(1, 0, 0, 0.0);        gt[0].t = Eigen::Vector3d(0, 0, 0);
+  gt[1].R = makeRotation(0.2, -0.5, 1.0, 0.6); gt[1].t = Eigen::Vector3d(1, -2, 0.5);
+  gt[2].R = makeRotation(0.7, 0.1, -0.3, 1.2); gt[2].t = Eigen::Vector3d(-1, 0.4, -1.5);
+  gt[3].R = makeRotation(-1, 0.3, 0.4, -0.9);  gt[3].t = Eigen::Vector3d(-0.5, 1.5, 2.0);
+  return gt;
+}
+} // namespace
+
+// Scaling every edge weight by the same constant does not change the result.
+TEST(MultiviewTest, MultiScanGraphUniformWeightInvariance) {
+  auto gt = fourPoseGt();
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {3, 0}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/5);
+
+  auto unweighted = teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3));
+  std::vector<double> w(graph.size(), 3.0);
+  auto weighted =
+      teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3), {}, w);
+
+  ASSERT_EQ(weighted.num_components, 1);
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_TRUE(weighted.valid[n]);
+    EXPECT_LE(teaser::test::getAngularError(unweighted.poses[n].R, weighted.poses[n].R), 1e-5);
+    EXPECT_LE((unweighted.poses[n].t - weighted.poses[n].t).norm(), 1e-5);
+  }
+}
+
+// Non-uniform per-edge weights: recovery still succeeds (plumbing end-to-end).
+TEST(MultiviewTest, MultiScanGraphWeightedRecovery) {
+  auto gt = fourPoseGt();
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {3, 0}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/5);
+
+  std::vector<double> w = {1.0, 2.0, 3.0, 4.0};
+  auto res =
+      teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3), {}, w);
+
+  ASSERT_EQ(res.num_components, 1);
+  const int anchor = 0;
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_TRUE(res.valid[n]);
+    Eigen::Matrix3d R_rel = gt[anchor].R.transpose() * gt[n].R;
+    Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
+    EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
+    EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
+  }
+}
+
+// A zero-weight (redundant) edge contributes nothing but does not break alignment.
+TEST(MultiviewTest, MultiScanGraphZeroWeightEdge) {
+  auto gt = fourPoseGt();
+  // 4-cycle plus a redundant diagonal {0,2} that we zero out.
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {0, 2}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/5);
+
+  std::vector<double> w = {1.0, 1.0, 1.0, 1.0, 0.0}; // diagonal {0,2} has zero weight
+  auto res =
+      teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3), {}, w);
+
+  ASSERT_EQ(res.num_components, 1);
+  const int anchor = 0;
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_TRUE(res.valid[n]);
+    Eigen::Matrix3d R_rel = gt[anchor].R.transpose() * gt[n].R;
+    Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
+    EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
+    EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
+  }
+}
+
 // Degenerate input (too few correspondences) is reported as invalid.
 TEST(MultiviewTest, DegenerateInput) {
   teaser::MultiviewSolver solver(makeParams(1e-4));

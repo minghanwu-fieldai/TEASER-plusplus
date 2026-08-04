@@ -26,7 +26,8 @@ int teaser::teaser_default_max_threads() {
 
 void teaser::ScalarTLSEstimator::estimate(const Eigen::RowVectorXd& X,
                                           const Eigen::RowVectorXd& ranges, double* estimate,
-                                          Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) {
+                                          Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+                                          const Eigen::RowVectorXd* prior_weights) {
   // check input parameters
   bool dimension_inconsistent = (X.rows() != ranges.rows()) || (X.cols() != ranges.cols());
   if (inliers) {
@@ -50,6 +51,11 @@ void teaser::ScalarTLSEstimator::estimate(const Eigen::RowVectorXd& X,
   // calculate weights
   Eigen::RowVectorXd weights = ranges.array().square();
   weights = weights.array().inverse();
+  // Optional per-measurement prior weight scales the weighted mean (weight = prior / range^2),
+  // leaving the consensus intervals and truncation (which use `ranges`) unchanged.
+  if (prior_weights) {
+    weights = weights.cwiseProduct(*prior_weights);
+  }
   int nr_centers = 2 * N;
   Eigen::RowVectorXd x_hat = Eigen::MatrixXd::Zero(1, nr_centers);
   Eigen::RowVectorXd x_cost = Eigen::MatrixXd::Zero(1, nr_centers);
@@ -212,7 +218,8 @@ void teaser::ScalarTLSEstimator::estimate_tiled(const Eigen::RowVectorXd& X,
 void teaser::FastGlobalRegistrationSolver::solveForRotation(
     const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
     const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst, Eigen::Matrix3d* rotation,
-    Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) {
+    Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+    const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights) {
   assert(rotation);                 // make sure R is not a nullptr
   assert(src.cols() == dst.cols()); // check dimensions of input data
   assert(params_.gnc_factor > 1);   // make sure mu will decrease
@@ -239,6 +246,15 @@ void teaser::FastGlobalRegistrationSolver::solveForRotation(
   Eigen::Matrix<double, 1, Eigen::Dynamic> l_pq(1, match_size);
   l_pq.setOnes(1, match_size);
 
+  // Optional per-correspondence prior weight; all ones when absent (behavior unchanged).
+  Eigen::Matrix<double, 1, Eigen::Dynamic> prior;
+  if (prior_weights) {
+    assert(prior_weights->cols() == static_cast<Eigen::Index>(match_size));
+    prior = *prior_weights;
+  } else {
+    prior = Eigen::Matrix<double, 1, Eigen::Dynamic>::Ones(1, match_size);
+  }
+
   // Assumptions of the two inputs:
   // they should be of the same scale,
   // outliers should be removed as much as possible
@@ -256,8 +272,8 @@ void teaser::FastGlobalRegistrationSolver::solveForRotation(
       l_pq(j) = std::pow(scaled_mu / (scaled_mu + rpq.squaredNorm()), 2);
     }
 
-    // 2. Optimize for Rotation Matrix
-    *rotation = teaser::utils::svdRot(src, dst, l_pq);
+    // 2. Optimize for Rotation Matrix (line-process weights scaled by the prior)
+    *rotation = teaser::utils::svdRot(src, dst, l_pq.cwiseProduct(prior));
 
     // update cost
     Eigen::Matrix<double, 3, Eigen::Dynamic> diff = (dst - (*rotation) * src).array().square();
@@ -286,7 +302,8 @@ void teaser::FastGlobalRegistrationSolver::solveForRotation(
 void teaser::QuatroSolver::solveForRotation(
     const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
     const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst, Eigen::Matrix3d* rotation,
-    Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) {
+    Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+    const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights) {
   assert(rotation);                 // make sure R is not a nullptr
   assert(src.cols() == dst.cols()); // check dimensions of input data
   assert(params_.gnc_factor > 1);   // make sure mu will increase
@@ -345,11 +362,20 @@ void teaser::QuatroSolver::solveForRotation(
   weights.setOnes(1, match_size);
   Eigen::Matrix<double, 1, Eigen::Dynamic> residuals_sq(1, match_size);
 
+  // Optional per-correspondence prior weight; all ones when absent (behavior unchanged).
+  Eigen::Matrix<double, 1, Eigen::Dynamic> prior;
+  if (prior_weights) {
+    assert(prior_weights->cols() == static_cast<Eigen::Index>(match_size));
+    prior = *prior_weights;
+  } else {
+    prior = Eigen::Matrix<double, 1, Eigen::Dynamic>::Ones(1, match_size);
+  }
+
   // Loop for performing GNC-TLS
   for (size_t i = 0; i < params_.max_iterations; ++i) {
 
-    // Fix weights and perform SVD 2d rotation estimation
-    rotation_2d = teaser::utils::svdRot2d(src_2d, dst_2d, weights);
+    // Fix weights and perform SVD 2d rotation estimation (weights scaled by the prior)
+    rotation_2d = teaser::utils::svdRot2d(src_2d, dst_2d, weights.cwiseProduct(prior));
 
     // Calculate residuals squared
     diffs = (dst_2d - rotation_2d * src_2d).array().square();
@@ -374,7 +400,7 @@ void teaser::QuatroSolver::solveForRotation(
     for (size_t j = 0; j < match_size; ++j) {
       // Also calculate cost in this loop
       // Note: the cost calculated is using the previously solved weights
-      cost_ += weights(j) * residuals_sq(j);
+      cost_ += prior(j) * weights(j) * residuals_sq(j);
 
       if (residuals_sq(j) >= th1) {
         weights(j) = 0;
@@ -451,10 +477,14 @@ void teaser::ScaleInliersSelector::solveForScale(
 void teaser::TLSTranslationSolver::solveForTranslation(
     const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
     const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst, Eigen::Vector3d* translation,
-    Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) {
+    Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+    const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights) {
   assert(src.cols() == dst.cols());
   if (inliers) {
     assert(inliers->cols() == src.cols());
+  }
+  if (prior_weights) {
+    assert(prior_weights->cols() == src.cols());
   }
 
   // Raw translation
@@ -465,11 +495,14 @@ void teaser::TLSTranslationSolver::solveForTranslation(
   double beta = noise_bound_ * sqrt(cbar2_);
   Eigen::Matrix<double, 1, Eigen::Dynamic> alphas = beta * Eigen::MatrixXd::Ones(1, N);
 
-  // Estimate x, y, and z component of translation: perform TLS on each row
+  // Estimate x, y, and z component of translation: perform TLS on each row. An optional prior
+  // weight scales each correspondence's contribution to the (per-axis) weighted mean.
   *inliers = Eigen::Matrix<bool, 1, Eigen::Dynamic>::Ones(1, N);
   Eigen::Matrix<bool, 1, Eigen::Dynamic> inliers_temp(1, N);
+  const Eigen::RowVectorXd* prior_ptr = prior_weights ? prior_weights : nullptr;
   for (size_t i = 0; i < raw_translation.rows(); ++i) {
-    tls_estimator_.estimate(raw_translation.row(i), alphas, &((*translation)(i)), &inliers_temp);
+    tls_estimator_.estimate(raw_translation.row(i), alphas, &((*translation)(i)), &inliers_temp,
+                            prior_ptr);
     // element-wise AND using component-wise product (Eigen 3.2 compatible)
     // a point is an inlier iff. x,y,z are all inliers
     *inliers = (*inliers).cwiseProduct(inliers_temp);
@@ -573,8 +606,19 @@ teaser::RobustRegistrationSolver::solve(const teaser::PointCloud& src_cloud,
 
 teaser::RegistrationSolution
 teaser::RobustRegistrationSolver::solve(const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
-                                        const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst) {
+                                        const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst,
+                                        const std::vector<double>& corr_weights) {
   assert(scale_solver_ && rotation_solver_ && translation_solver_);
+
+  // Store optional per-correspondence weights (one per column of src/dst). Empty => unweighted.
+  if (corr_weights.empty()) {
+    input_weights_.resize(1, 0);
+  } else {
+    assert(static_cast<int>(corr_weights.size()) == src.cols());
+    input_weights_ =
+        Eigen::Map<const Eigen::Matrix<double, 1, Eigen::Dynamic>>(corr_weights.data(),
+                                                                   1, corr_weights.size());
+  }
 
   // Handle deprecated params
   if (!params_.use_max_clique) {
@@ -659,6 +703,16 @@ teaser::RobustRegistrationSolver::solve(const Eigen::Matrix<double, 3, Eigen::Dy
     }
   }
 
+  // Per-correspondence weights, if provided, are propagated to a per-pruned-TIM weight (rotation)
+  // and a per-clique-inlier weight (translation). Each pruned TIM connects two correspondences; its
+  // weight is the geometric mean of the two endpoint weights (so a within-edge TIM whose endpoints
+  // share weight w gets exactly w, and a cross-edge TIM gets sqrt(w_a*w_b)).
+  const bool weighted = input_weights_.cols() > 0;
+  auto gmean = [](double a, double b) {
+    return std::sqrt(std::max(0.0, a) * std::max(0.0, b));
+  };
+  Eigen::Matrix<double, 1, Eigen::Dynamic> w_tim;
+
   // Calculate new measurements & TIMs based on max clique inliers
   if (params_.rotation_tim_graph == INLIER_GRAPH_FORMULATION::CHAIN) {
     // chain graph
@@ -667,6 +721,9 @@ teaser::RobustRegistrationSolver::solve(const Eigen::Matrix<double, 3, Eigen::Dy
     pruned_dst_tims_.resize(3, max_clique_.size());
     src_tims_map_rotation_.resize(2, max_clique_.size());
     dst_tims_map_rotation_.resize(2, max_clique_.size());
+    if (weighted) {
+      w_tim.resize(1, max_clique_.size());
+    }
     for (size_t i = 0; i < max_clique_.size(); ++i) {
       const auto& root = max_clique_[i];
       int leaf;
@@ -683,6 +740,11 @@ teaser::RobustRegistrationSolver::solve(const Eigen::Matrix<double, 3, Eigen::Dy
       dst_tims_map_rotation_(1, i) = root;
       src_tims_map_rotation_(0, i) = leaf;
       src_tims_map_rotation_(1, i) = root;
+
+      // this pruned TIM connects original correspondences `leaf` and `root`
+      if (weighted) {
+        w_tim(i) = gmean(input_weights_(leaf), input_weights_(root));
+      }
     }
   } else {
     // complete graph
@@ -697,6 +759,17 @@ teaser::RobustRegistrationSolver::solve(const Eigen::Matrix<double, 3, Eigen::Dy
     // construct the TIMs
     pruned_dst_tims_ = computeTIMs(dst_inliers, &dst_tims_map_rotation_);
     pruned_src_tims_ = computeTIMs(src_inliers, &src_tims_map_rotation_);
+
+    // Here the rotation TIM map holds indices INTO the clique (0..clique_size-1), so map back to
+    // original correspondence indices through max_clique_ before combining the endpoint weights.
+    if (weighted) {
+      w_tim.resize(1, pruned_src_tims_.cols());
+      for (Eigen::Index k = 0; k < pruned_src_tims_.cols(); ++k) {
+        const int a = max_clique_[src_tims_map_rotation_(0, k)];
+        const int b = max_clique_[src_tims_map_rotation_(1, k)];
+        w_tim(k) = gmean(input_weights_(a), input_weights_(b));
+      }
+    }
   }
 
   // Remove scaling for rotation estimation
@@ -711,7 +784,7 @@ teaser::RobustRegistrationSolver::solve(const Eigen::Matrix<double, 3, Eigen::Dy
 
   // Solve for rotation
   TEASER_DEBUG_INFO_MSG("Starting rotation solver.");
-  solveForRotation(pruned_src_tims_, pruned_dst_tims_);
+  solveForRotation(pruned_src_tims_, pruned_dst_tims_, weighted ? &w_tim : nullptr);
   TEASER_DEBUG_INFO_MSG("Rotation estimation complete.");
 
   // Save indices of inlier TIMs from GNC rotation estimation
@@ -722,15 +795,22 @@ teaser::RobustRegistrationSolver::solve(const Eigen::Matrix<double, 3, Eigen::Dy
   }
   Eigen::Matrix<double, 3, Eigen::Dynamic> rotation_pruned_src(3, max_clique_.size());
   Eigen::Matrix<double, 3, Eigen::Dynamic> rotation_pruned_dst(3, max_clique_.size());
+  Eigen::Matrix<double, 1, Eigen::Dynamic> w_trans;
+  if (weighted) {
+    w_trans.resize(1, max_clique_.size());
+  }
   for (size_t i = 0; i < max_clique_.size(); ++i) {
     rotation_pruned_src.col(i) = src.col(max_clique_[i]);
     rotation_pruned_dst.col(i) = dst.col(max_clique_[i]);
+    if (weighted) {
+      w_trans(i) = input_weights_(max_clique_[i]); // per clique-inlier point weight
+    }
   }
 
   // Solve for translation
   TEASER_DEBUG_INFO_MSG("Starting translation solver.");
   solveForTranslation(solution_.scale * solution_.rotation * rotation_pruned_src,
-                      rotation_pruned_dst);
+                      rotation_pruned_dst, weighted ? &w_trans : nullptr);
   TEASER_DEBUG_INFO_MSG("Translation estimation complete.");
 
   // Find the final inliers
@@ -752,25 +832,29 @@ double teaser::RobustRegistrationSolver::solveForScale(
 
 Eigen::Vector3d teaser::RobustRegistrationSolver::solveForTranslation(
     const Eigen::Matrix<double, 3, Eigen::Dynamic>& v1,
-    const Eigen::Matrix<double, 3, Eigen::Dynamic>& v2) {
+    const Eigen::Matrix<double, 3, Eigen::Dynamic>& v2,
+    const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights) {
   translation_inliers_mask_.resize(1, v1.cols());
   translation_solver_->solveForTranslation(v1, v2, &(solution_.translation),
-                                           &translation_inliers_mask_);
+                                           &translation_inliers_mask_, prior_weights);
   return solution_.translation;
 }
 
 Eigen::Matrix3d teaser::RobustRegistrationSolver::solveForRotation(
     const Eigen::Matrix<double, 3, Eigen::Dynamic>& v1,
-    const Eigen::Matrix<double, 3, Eigen::Dynamic>& v2) {
+    const Eigen::Matrix<double, 3, Eigen::Dynamic>& v2,
+    const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights) {
   rotation_inliers_mask_.resize(1, v1.cols());
-  rotation_solver_->solveForRotation(v1, v2, &(solution_.rotation), &rotation_inliers_mask_);
+  rotation_solver_->solveForRotation(v1, v2, &(solution_.rotation), &rotation_inliers_mask_,
+                                     prior_weights);
   return solution_.rotation;
 }
 
 void teaser::GNCTLSRotationSolver::solveForRotation(
     const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
     const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst, Eigen::Matrix3d* rotation,
-    Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) {
+    Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+    const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights) {
   assert(rotation);                 // make sure R is not a nullptr
   assert(src.cols() == dst.cols()); // check dimensions of input data
   assert(params_.gnc_factor > 1);   // make sure mu will increase
@@ -808,11 +892,21 @@ void teaser::GNCTLSRotationSolver::solveForRotation(
   weights.setOnes(1, match_size);
   Eigen::Matrix<double, 1, Eigen::Dynamic> residuals_sq(1, match_size);
 
+  // Optional per-correspondence prior weight scaling every term of the cost. When absent it is all
+  // ones, so behavior is identical to the unweighted solver.
+  Eigen::Matrix<double, 1, Eigen::Dynamic> prior;
+  if (prior_weights) {
+    assert(prior_weights->cols() == static_cast<Eigen::Index>(match_size));
+    prior = *prior_weights;
+  } else {
+    prior = Eigen::Matrix<double, 1, Eigen::Dynamic>::Ones(1, match_size);
+  }
+
   // Loop for performing GNC-TLS
   for (size_t i = 0; i < params_.max_iterations; ++i) {
 
-    // Fix weights and perform SVD rotation estimation
-    *rotation = teaser::utils::svdRot(src, dst, weights);
+    // Fix weights and perform SVD rotation estimation (line-process weights scaled by the prior)
+    *rotation = teaser::utils::svdRot(src, dst, weights.cwiseProduct(prior));
 
     // Calculate residuals squared
     diffs = (dst - (*rotation) * src).array().square();
@@ -835,9 +929,9 @@ void teaser::GNCTLSRotationSolver::solveForRotation(
     double th2 = mu / (mu + 1) * noise_bound_sq;
     cost_ = 0;
     for (size_t j = 0; j < match_size; ++j) {
-      // Also calculate cost in this loop
+      // Also calculate cost in this loop (scaled by the per-correspondence prior weight)
       // Note: the cost calculated is using the previously solved weights
-      cost_ += weights(j) * residuals_sq(j);
+      cost_ += prior(j) * weights(j) * residuals_sq(j);
 
       if (residuals_sq(j) >= th1) {
         weights(j) = 0;

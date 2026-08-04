@@ -72,10 +72,11 @@ public:
    * @param dst
    * @return estimated rotation matrix (R)
    */
-  virtual void solveForRotation(const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
-                                const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst,
-                                Eigen::Matrix3d* rotation,
-                                Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) = 0;
+  virtual void solveForRotation(
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst, Eigen::Matrix3d* rotation,
+      Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+      const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights = nullptr) = 0;
 };
 
 /**
@@ -93,10 +94,11 @@ public:
    * @param dst
    * @return estimated translation vector
    */
-  virtual void solveForTranslation(const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
-                                   const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst,
-                                   Eigen::Vector3d* translation,
-                                   Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) = 0;
+  virtual void solveForTranslation(
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst, Eigen::Vector3d* translation,
+      Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+      const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights = nullptr) = 0;
 };
 
 /**
@@ -115,7 +117,8 @@ public:
    * @param inliers (output) pointer to a Eigen row vector of inliers
    */
   void estimate(const Eigen::RowVectorXd& X, const Eigen::RowVectorXd& ranges, double* estimate,
-                Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers);
+                Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+                const Eigen::RowVectorXd* prior_weights = nullptr);
 
   /**
    * A slightly different implementation of TLS estimate. Use loop tiling to achieve potentially
@@ -203,10 +206,11 @@ public:
    * @param translation output parameter for the translation vector
    * @param inliers output parameter for detected outliers
    */
-  void solveForTranslation(const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
-                           const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst,
-                           Eigen::Vector3d* translation,
-                           Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) override;
+  void solveForTranslation(
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst, Eigen::Vector3d* translation,
+      Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+      const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights = nullptr) override;
 
 private:
   double noise_bound_;
@@ -271,10 +275,11 @@ public:
    * @param rotation
    * @param inliers
    */
-  void solveForRotation(const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
-                        const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst,
-                        Eigen::Matrix3d* rotation,
-                        Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) override;
+  void solveForRotation(
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst, Eigen::Matrix3d* rotation,
+      Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+      const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights = nullptr) override;
 };
 
 /**
@@ -308,10 +313,11 @@ public:
    * @param dst
    * @return a RegistrationSolution struct.
    */
-  void solveForRotation(const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
-                        const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst,
-                        Eigen::Matrix3d* rotation,
-                        Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) override;
+  void solveForRotation(
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst, Eigen::Matrix3d* rotation,
+      Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+      const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights = nullptr) override;
 };
 
 /**
@@ -346,10 +352,11 @@ public:
    * @param dst
    * @return a RegistrationSolution struct.
    */
-  void solveForRotation(const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
-                        const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst,
-                        Eigen::Matrix3d* rotation,
-                        Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers) override;
+  void solveForRotation(
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst, Eigen::Matrix3d* rotation,
+      Eigen::Matrix<bool, 1, Eigen::Dynamic>* inliers,
+      const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights = nullptr) override;
 };
 
 /**
@@ -565,9 +572,12 @@ public:
    * Solve for scale, translation and rotation. Assumes dst is src after transformation.
    * @param src
    * @param dst
+   * @param corr_weights optional per-correspondence (per-column) weights that scale each
+   *        correspondence's contribution to the rotation and translation costs. Empty = unweighted.
    */
   RegistrationSolution solve(const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
-                             const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst);
+                             const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst,
+                             const std::vector<double>& corr_weights = {});
 
   /**
    * Solve for scale. Assume v2 = s * R * v1, this function estimates s.
@@ -582,16 +592,20 @@ public:
    * @param v1
    * @param v2
    */
-  Eigen::Vector3d solveForTranslation(const Eigen::Matrix<double, 3, Eigen::Dynamic>& v1,
-                                      const Eigen::Matrix<double, 3, Eigen::Dynamic>& v2);
+  Eigen::Vector3d solveForTranslation(
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& v1,
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& v2,
+      const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights = nullptr);
 
   /**
    * Solve for rotation. Assume v2 = R * v1, this function estimates find R.
    * @param v1
    * @param v2
    */
-  Eigen::Matrix3d solveForRotation(const Eigen::Matrix<double, 3, Eigen::Dynamic>& v1,
-                                   const Eigen::Matrix<double, 3, Eigen::Dynamic>& v2);
+  Eigen::Matrix3d solveForRotation(
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& v1,
+      const Eigen::Matrix<double, 3, Eigen::Dynamic>& v2,
+      const Eigen::Matrix<double, 1, Eigen::Dynamic>* prior_weights = nullptr);
 
   /**
    * Return the cost at termination of the GNC rotation solver. Can be used to
@@ -892,6 +906,9 @@ public:
 private:
   Params params_;
   RegistrationSolution solution_;
+
+  // Optional per-correspondence weights (one per input column). Empty => unweighted.
+  Eigen::Matrix<double, 1, Eigen::Dynamic> input_weights_;
 
   // Inlier Binary Vectors
   Eigen::Matrix<bool, 1, Eigen::Dynamic> scale_inliers_mask_;
