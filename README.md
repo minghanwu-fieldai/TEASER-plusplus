@@ -223,9 +223,22 @@ teaser::MultiScanResult teaser::alignMultiScan(
   weights and correspondences must be supplied by the caller.
 
 **Bring your own graph.** If you would rather supply the topology yourself, call
-`teaser::alignMultiScanWithGraph(clouds, graph_edges, correspondences, params)` instead — it skips
-the MST step and works over the `graph_edges` you provide (undirected `(i,j)` pairs, duplicates
-ignored). Unlike the MST path, **it respects the whole graph, tree or not**: connected components
+`alignMultiScanWithGraph` instead — it skips the MST step and works over the `graph_edges` you
+provide (undirected `(i,j)` pairs, duplicates ignored). Its full signature (the last two arguments
+are optional and covered below):
+
+```cpp
+teaser::MultiScanResult teaser::alignMultiScanWithGraph(
+    const std::vector<teaser::PointCloud>& clouds,       // clouds[i] = scan i, in scan i's local frame
+    const std::vector<std::pair<int,int>>& graph_edges,  // undirected overlap edges (tree or general graph)
+    const std::map<std::pair<int,int>,                   // per-edge putative correspondences, keyed by
+                   std::vector<std::pair<int,int>>>& correspondences,  //   (min(i,j),max(i,j))
+    const teaser::RobustRegistrationSolver::Params& params,
+    const std::vector<int>& order = {},                  // optional topological order (root-most first)
+    const std::vector<double>& edge_weights = {});       // optional per-edge weights (aligned with graph_edges)
+```
+
+Unlike the MST path, **it respects the whole graph, tree or not**: connected components
 are derived from the edges (a warning is still emitted if there is more than one), the
 highest-degree node of each component (ties → smallest index) is the anchor/root, and a BFS from
 that root assigns a discovery order used to orient every edge from the earlier-discovered endpoint
@@ -235,6 +248,24 @@ all of its already-posed parents at once (the multi-edge aggregation from `multi
 of those edges gets its own entry in `edge_residual`. Any node with no edges
 becomes its own single-node component with the identity pose. The per-component identity gauge and
 child-as-target convention are the same as the MST path.
+
+**Control the order.** `alignMultiScanWithGraph` takes an optional last argument `order` — a
+topological list of node indices, root-most first (e.g. a sequential capture order). When given, it
+replaces the automatic highest-degree/BFS reference: it picks each component's anchor (the earliest
+listed node), orients every edge (earlier in the order = parent), and sets the order in which scans
+are aligned. Nodes absent from a non-empty `order` are ranked after all listed ones, and a node
+whose neighbors are all later in the order is still aligned once one of them is posed (BFS
+fallback), so an order that doesn't perfectly match the graph never leaves scans unaligned.
+
+**Weight the edges.** `alignMultiScanWithGraph` also takes an optional `edge_weights` — one weight
+per entry of `graph_edges`. Edge `i`'s weight scales every one of its correspondences in the
+aggregated rotation **and** translation TLS cost (empty = all weight 1). This is threaded exactly
+through the solver: a per-correspondence weight is carried into the weighted rotation SVD and the
+translation weighted mean; for the TIM-based rotation, each pruned TIM's weight is the geometric
+mean of its two endpoint correspondence weights (so a within-edge TIM keeps that edge's weight).
+⚠️ The weight scales the cost **among the max-clique inliers** — it does not influence max-clique
+inlier selection or the scale-consistency prune, so it refines the fit among already-consistent
+correspondences rather than arbitrating between conflicting edges.
 
 See `test/teaser/multiview-test.cc` for end-to-end usage.
 
