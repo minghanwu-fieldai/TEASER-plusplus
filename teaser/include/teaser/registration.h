@@ -241,33 +241,37 @@ public:
      * no yaw dependence at all.
      *
      * lambda is derived from this parameter as
-     *   lambda = tilt_prior_eta * N * L^2,
-     * where N is the number of input vectors and L their RMS length. tilt_prior_eta is therefore
-     * the weight of the prior relative to the full measurement mass, and is invariant to both
-     * point-cloud scale and correspondence count.
+     *   lambda = tilt_prior_eta * sum_j w_j * ||src_j||^2,
+     * i.e. tilt_prior_eta * N * L^2 where N is the effective inlier count at the current GNC
+     * iteration and L their RMS length (w_j being the line-process weights times any
+     * per-correspondence prior weights -- exactly the measurement mass present in the weighted
+     * Wahba correlation matrix). tilt_prior_eta is therefore the weight of the prior relative to
+     * the measurements that currently survive, and is invariant to point-cloud scale, to
+     * correspondence count, and to how many correspondences GNC has rejected so far.
      *
      * Set to 0 (the default) to disable the prior entirely, which reproduces the unpenalized
      * solver exactly. 0.5 is a reasonable value when enabling it. Must be >= 0; a negative value
      * causes solveForRotation to throw std::invalid_argument.
      *
-     * \attention **Calibrate eta against the noise bound.** The prior works by pulling the
-     * rotation away from the least-squares fit, which necessarily *increases* the residuals. GNC
-     * classifies a correspondence as an outlier once its residual exceeds the noise bound, so if
-     * eta is large enough to move the rotation by more than the noise budget allows, the
-     * measurements start being rejected -- which lets the prior dominate further, rejecting more of
-     * them. In the limit every weight reaches zero and the returned rotation is determined by the
-     * prior alone: it has the requested up axis but an arbitrary yaw. The solvers emit a warning
-     * when that happens.
+     * \attention lambda is recomputed every iteration against the *current* weights, not fixed
+     * from the initial correspondence set. This matters because the prior necessarily increases
+     * residuals (it pulls the rotation off the least-squares fit), and GNC rejects a
+     * correspondence once its residual exceeds the noise bound. With a fixed lambda that is a
+     * runaway: rejecting measurements shrinks sum(w) while lambda stays put, so the prior's
+     * relative pull grows, rejecting more of them, until every weight is zero and the rotation is
+     * determined by the prior alone. Scaling lambda with the surviving mass holds the prior's
+     * relative strength at exactly tilt_prior_eta throughout, which removes that positive
+     * feedback.
      *
-     * As a rule of thumb the tilt correction the prior can buy is bounded by the noise budget: a
-     * correction of Dphi radians costs about (L*Dphi)^2 per correspondence, so it is only tenable
-     * while (L*Dphi)^2 stays below cbar2*noise_bound^2. Wanting a large tilt correction under a
-     * tight noise bound is contradictory -- widen noise_bound, or use QUATRO if the intent is
-     * really a hard yaw-only constraint.
+     * \attention The flip side is that the iteration no longer minimizes one fixed objective --
+     * lambda changes with the weights -- so the exact penalized-least-squares reading only holds
+     * for a single R-step. In practice the sequence still settles; the first iteration (all
+     * weights 1) is exactly eta * N * L^2 over the full input.
      *
-     * \attention lambda is held fixed while the sum of the GNC line-process weights shrinks as
-     * outliers are annealed away, so the prior's *effective* relative strength grows over the
-     * iterations, reaching tilt_prior_eta * N / sum(w) at termination.
+     * \attention eta is a *relative* strength, so it does not by itself bound how far the rotation
+     * moves. A correction of Dphi radians costs about (L*Dphi)^2 per correspondence, so demanding a
+     * large tilt correction under a tight noise_bound still means the fit will sit outside the
+     * noise bound. Widen noise_bound, or use QUATRO if the intent is a hard yaw-only constraint.
      *
      * \attention Ignored by QuatroSolver, which estimates yaw only and therefore already has
      * zero pitch and roll by construction.
@@ -593,10 +597,9 @@ public:
      * Must be >= 0, otherwise reset() throws std::invalid_argument.
      *
      * Forwarded to GNCRotationSolver::Params::tilt_prior_eta; see that field for the full
-     * definition and caveats -- in particular, eta has to be calibrated against noise_bound, since
-     * a prior strong enough to move the rotation further than the noise budget allows will cause
-     * GNC to reject the measurements. Honored by GNC_TLS and FGR; ignored by QUATRO, which
-     * estimates yaw only.
+     * definition and caveats. eta is the prior's weight relative to the measurement mass surviving
+     * at the current GNC iteration, so it holds that relative strength as outliers are annealed
+     * away. Honored by GNC_TLS and FGR; ignored by QUATRO, which estimates yaw only.
      *
      * \attention Note the rotation solver runs on TIMs, whose noise bound is the point noise bound
      * scaled by 2/scale, and whose count is the pruned TIM count (k(k-1)/2 for a complete graph

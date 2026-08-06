@@ -40,16 +40,25 @@ namespace {
  */
 struct TiltPrior {
   bool active = false;
-  double lambda = 0.0;
+  double eta = 0.0;
+  /// Per-input squared norms ||src_j||^2, cached so lambda is one dot product per iteration.
+  Eigen::Matrix<double, 1, Eigen::Dynamic> sq_norms;
   Eigen::Vector3d u_src = Eigen::Vector3d::UnitZ();
   Eigen::Vector3d u_dst = Eigen::Vector3d::UnitZ();
+
+  /**
+   * lambda = eta * sum_j w_j * ||src_j||^2, i.e. eta * N * L^2 evaluated over the measurement mass
+   * that is actually present in H at this iteration (N the effective inlier count, L their RMS
+   * length). Recomputed per iteration so eta keeps meaning "the prior's weight relative to the
+   * surviving measurements" as GNC anneals outliers away, rather than relative to the initial set.
+   */
+  double lambda(const Eigen::Matrix<double, 1, Eigen::Dynamic>& weights) const {
+    return eta * (weights.array() * sq_norms.array()).sum();
+  }
 };
 
 /**
- * Validate the tilt-prior params and precompute lambda = eta * N * L^2, where N is the number of
- * input vectors and L their RMS length. That product is exactly eta * sum_j ||src_j||^2, which makes
- * eta the weight of the prior relative to the full measurement mass -- invariant to point-cloud
- * scale and to the number of correspondences.
+ * Validate the tilt-prior params and cache what lambda needs.
  *
  * @throws std::invalid_argument if eta < 0, or if an up vector is degenerate while eta > 0.
  */
@@ -67,17 +76,20 @@ TiltPrior makeTiltPrior(const teaser::GNCRotationSolver::Params& params,
     throw std::invalid_argument(
         "teaser: tilt prior up_src/up_dst must be nonzero when tilt_prior_eta > 0");
   }
-  // N * L^2 == sum of squared column norms.
-  tp.lambda = params.tilt_prior_eta * src.colwise().squaredNorm().sum();
+  tp.eta = params.tilt_prior_eta;
+  tp.sq_norms = src.colwise().squaredNorm();
   tp.u_src = params.up_src.normalized();
   tp.u_dst = params.up_dst.normalized();
-  tp.active = tp.lambda > 0.0;
+  tp.active = true;
   return tp;
 }
 
 /**
  * The GNC R-step (weighted Wahba / orthogonal Procrustes) with the tilt prior folded in as one
  * extra weighted correspondence. Falls through to plain svdRot when the prior is disabled.
+ *
+ * `weights` must be the same effective weight vector that goes into H (GNC line-process weights
+ * times any per-correspondence prior weights), since lambda is scaled by that same mass.
  *
  * Note the prior deliberately participates ONLY here. It must not enter the residuals, the mu
  * initialization, the reported cost, or the inlier mask: it is a prior, not a measurement, so
@@ -88,7 +100,10 @@ Eigen::Matrix3d svdRotWithTiltPrior(const Eigen::Matrix<double, 3, Eigen::Dynami
                                     const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst,
                                     const Eigen::Matrix<double, 1, Eigen::Dynamic>& weights,
                                     const TiltPrior& tp) {
-  if (!tp.active) {
+  const double lambda = tp.active ? tp.lambda(weights) : 0.0;
+  if (lambda <= 0.0) {
+    // Either disabled, or every measurement weight has collapsed -- in which case the prior scales
+    // to nothing too and there is no rank-1 term to add.
     return teaser::utils::svdRot(src, dst, weights);
   }
   const Eigen::Index N = src.cols();
@@ -97,7 +112,7 @@ Eigen::Matrix3d svdRotWithTiltPrior(const Eigen::Matrix<double, 3, Eigen::Dynami
   Eigen::Matrix<double, 1, Eigen::Dynamic> w_aug(1, N + 1);
   src_aug << src, tp.u_src;
   dst_aug << dst, tp.u_dst;
-  w_aug << weights, tp.lambda;
+  w_aug << weights, lambda;
   return teaser::utils::svdRot(src_aug, dst_aug, w_aug);
 }
 
@@ -378,11 +393,10 @@ void teaser::FastGlobalRegistrationSolver::solveForRotation(
   }
 
   // See the equivalent note in GNCTLSRotationSolver::solveForRotation. FGR's Geman-McClure weights
-  // decay smoothly rather than truncating, so this fires only in the fully collapsed case.
+  // decay smoothly rather than truncating, so this effectively never fires.
   if (tilt_prior.active && l_pq.maxCoeff() < 1e-12) {
-    TEASER_INFO_MSG("teaser: WARNING - the tilt prior drove every correspondence weight to zero. "
-                    "The estimated rotation is determined by the prior alone and its yaw is "
-                    "unconstrained. Reduce tilt_prior_eta or raise noise_bound.\n");
+    TEASER_INFO_MSG("teaser: WARNING - every correspondence weight collapsed to zero, so the "
+                    "estimated rotation is unconstrained.\n");
   }
 
   if (inliers) {
@@ -1063,15 +1077,15 @@ void teaser::GNCTLSRotationSolver::solveForRotation(
     }
   }
 
-  // A strong tilt prior can fight the data hard enough that every residual exceeds the noise bound,
-  // at which point GNC zeroes all the measurement weights and the augmented correlation matrix is
-  // the rank-1 prior term alone. The returned rotation then has the requested up axis but an
-  // essentially arbitrary yaw, so warn rather than report it silently. See tilt_prior_eta's docs for
-  // how to calibrate eta against the noise bound.
+  // If every measurement weight collapses to zero the correlation matrix is empty and the returned
+  // rotation is meaningless. Because lambda scales with the surviving measurement mass, the prior
+  // cannot drive this on its own (it vanishes along with the data) -- it means noise_bound is too
+  // tight for the residuals, so warn rather than report the rotation silently.
   if (tilt_prior.active && weights.maxCoeff() < 1e-12) {
-    TEASER_INFO_MSG("teaser: WARNING - the tilt prior rejected every correspondence (all GNC "
-                    "weights are zero). The estimated rotation is determined by the prior alone "
-                    "and its yaw is unconstrained. Reduce tilt_prior_eta or raise noise_bound.\n");
+    TEASER_INFO_MSG("teaser: WARNING - every GNC weight collapsed to zero, so the estimated "
+                    "rotation is unconstrained. The tilt prior scales with the surviving "
+                    "measurement mass and vanished with it; this indicates noise_bound is too "
+                    "tight for the data.\n");
   }
 
   if (inliers) {

@@ -614,27 +614,65 @@ TEST(RotationSolverTest, TiltPriorThroughRobustRegistrationSolver) {
 // like an outlier, GNC zeroes all the weights, and the rotation ends up determined by the prior
 // alone (correct up axis, arbitrary yaw). The solver warns; this test documents that it happens so
 // the behavior is not mistaken for a regression.
-TEST(RotationSolverTest, TiltPriorTooStrongForNoiseBoundRejectsEverything) {
+// lambda = eta * sum_j w_j ||src_j||^2 is recomputed each iteration against the current weights, so
+// correspondences GNC has rejected stop contributing to the prior's strength. The observable
+// consequence: adding outliers that get rejected must not change the answer at all. (Had lambda been
+// fixed from the initial input, these 20 extra columns would have roughly doubled it, over-
+// strengthening the prior relative to the 20 surviving inliers.)
+TEST(RotationSolverTest, TiltPriorLambdaTracksSurvivingInliers) {
+  const Eigen::Matrix3d ref_R = makeYPR(0.7, 0.30, -0.20);
+  const Eigen::Matrix<double, 3, Eigen::Dynamic> clean = deterministicPoints(20);
+
+  teaser::GNCTLSRotationSolver::Params params{100, 1e-12, 1.4, 0.5};
+  params.tilt_prior_eta = 0.5;
+
+  // Clean problem.
+  Eigen::Matrix3d R_clean;
+  Eigen::Matrix<bool, 1, Eigen::Dynamic> in_clean(1, 20);
+  teaser::GNCTLSRotationSolver solver_clean(params);
+  solver_clean.solveForRotation(clean, ref_R * clean, &R_clean, &in_clean);
+  ASSERT_EQ(in_clean.count(), 20);
+
+  // Same 20 correspondences plus 20 that will be rejected.
+  Eigen::Matrix<double, 3, Eigen::Dynamic> both(3, 40);
+  both << clean, deterministicPoints(20, 777);
+  Eigen::Matrix<double, 3, Eigen::Dynamic> dst = ref_R * both;
+  dst.rightCols(20) = 6.0 * deterministicPoints(20, 555);
+
+  Eigen::Matrix3d R_both;
+  Eigen::Matrix<bool, 1, Eigen::Dynamic> in_both(1, 40);
+  teaser::GNCTLSRotationSolver solver_both(params);
+  solver_both.solveForRotation(both, dst, &R_both, &in_both);
+
+  EXPECT_EQ(in_both.leftCols(20).count(), 20); // true inliers kept
+  EXPECT_EQ(in_both.rightCols(20).count(), 0); // outliers rejected
+  EXPECT_LT(teaser::test::getAngularError(R_clean, R_both), 1e-9);
+  // Sanity: the prior really was doing something in both cases.
+  EXPECT_LT(tiltAngle(R_clean), 0.6 * tiltAngle(ref_R));
+}
+
+// Documents a limitation that scaling lambda with the inlier count does NOT remove. Holding the
+// prior's *relative* strength at eta stops the runaway (rejections no longer make the prior
+// relatively stronger), but eta is not a bound on how far the rotation moves: the tilt correction it
+// asks for still has to fit inside the noise budget. Under a noise bound far too tight to pay for
+// that correction, every residual is an outlier from the first weight update onward, and the
+// rotation ends up unconstrained. The solver warns in that case.
+TEST(RotationSolverTest, TiltPriorTooTightNoiseBoundStillDegenerates) {
   const Eigen::Matrix<double, 3, Eigen::Dynamic> src = deterministicPoints(20);
   const Eigen::Matrix3d ref_R = makeYPR(0.7, 0.30, -0.20);
   const Eigen::Matrix<double, 3, Eigen::Dynamic> dst = ref_R * src;
 
-  // A tight noise bound cannot pay for the tilt correction eta = 0.5 demands.
   teaser::GNCTLSRotationSolver::Params params{100, 1e-12, 1.4, 1e-2};
   params.tilt_prior_eta = 0.5;
   teaser::GNCTLSRotationSolver solver(params);
-
   Eigen::Matrix3d R;
   Eigen::Matrix<bool, 1, Eigen::Dynamic> inliers(1, src.cols());
   solver.solveForRotation(src, dst, &R, &inliers);
-
   EXPECT_EQ(inliers.count(), 0);
-  // The up axis is still honored...
-  EXPECT_LT(tiltAngle(R), 1e-9);
-  // ...but the answer is nowhere near the ground truth.
   EXPECT_GT(teaser::test::getAngularError(ref_R, R), 0.1);
 
-  // The same eta with a noise bound wide enough to pay for the correction behaves properly.
+  // A noise bound wide enough to pay for the correction behaves properly: all correspondences are
+  // retained and the tilt is reduced without discarding the data.
   params.noise_bound = 0.5;
   teaser::GNCTLSRotationSolver ok_solver(params);
   Eigen::Matrix3d R_ok;
@@ -643,4 +681,5 @@ TEST(RotationSolverTest, TiltPriorTooStrongForNoiseBoundRejectsEverything) {
   EXPECT_EQ(inliers_ok.count(), src.cols());
   EXPECT_LT(tiltAngle(R_ok), tiltAngle(ref_R));
   EXPECT_GT(tiltAngle(R_ok), 0.0);
+  EXPECT_LT(teaser::test::getAngularError(ref_R, R_ok), 0.25);
 }
