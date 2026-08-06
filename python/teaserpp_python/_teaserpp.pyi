@@ -110,6 +110,17 @@ class RobustRegistrationSolver:
         max_clique_exact_solution: bool = True
         max_clique_time_limit: int = 3000
         max_clique_num_threads: int = OMP_MAX_THREADS
+        #: Strength of an optional soft penalty on pitch/roll in the GNC
+        #: rotation solvers, leaving yaw free. 0 disables it; 0.5 is a
+        #: reasonable value when enabling it. Must be >= 0. Honored by GNC_TLS
+        #: and FGR; ignored by QUATRO, which estimates yaw only.
+        #: Only settable through this Params class, not the positional
+        #: constructor below.
+        rotation_tilt_prior_eta: float = 0.0
+        #: Up axis in the src frame for the tilt prior, shape (3,).
+        rotation_up_src: np.ndarray
+        #: Up axis in the dst frame for the tilt prior, shape (3,).
+        rotation_up_dst: np.ndarray
 
     @overload
     def __init__(self, params: Params): ...
