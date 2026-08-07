@@ -13,6 +13,7 @@
 #include <cmath>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <queue>
@@ -20,6 +21,9 @@
 #include <utility>
 
 #include "teaser/registration.h"
+
+#include "rotation_sync.h"
+#include "translation_sync.h"
 
 std::vector<teaser::WeightedEdge>
 teaser::kruskalSpanningTree(int num_vertices, const std::vector<teaser::WeightedEdge>& edges,
@@ -190,33 +194,174 @@ teaser::MultiviewSolver::solveNodePose(const std::vector<teaser::NeighborEdge>& 
 
 namespace {
 
-// Build a NeighborEdge aligning `child` (target/dst) to an already-posed `parent` (fixed source)
-// over their shared correspondences. Returns false if no usable correspondence columns remain.
-bool buildNeighborEdge(const std::vector<teaser::PointCloud>& clouds,
-                       const std::vector<std::pair<int, int>>& corr, int parent, int child,
-                       const teaser::Pose& parent_pose, teaser::NeighborEdge* edge) {
-  const bool parent_is_min = (parent < child);
-  edge->R_i = parent_pose.R;
-  edge->t_i = parent_pose.t;
-  edge->src.resize(3, static_cast<Eigen::Index>(corr.size()));
-  edge->dst.resize(3, static_cast<Eigen::Index>(corr.size()));
+using Pts = Eigen::Matrix<double, 3, Eigen::Dynamic>;
+using RowVec = Eigen::Matrix<double, 1, Eigen::Dynamic>;
+
+// A graph edge reduced to what the two synchronization stages consume: the max-clique-pruned raw
+// correspondences (translation needs raw points) and their TIMs (rotation needs translation-free
+// measurements).
+struct PreparedEdge {
+  int p = -1;
+  int q = -1;
+  double confidence = 1.0;
+  Pts p_pts, q_pts;   // clique correspondences, each scan's local frame
+  Pts p_tims, q_tims; // TIMs of those points
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+
+// Pull edge (p,q)'s correspondences out of the clouds as two 3-by-m point matrices. The
+// correspondence map is keyed by (min,max), so which member of each pair indexes which cloud
+// depends on the node ordering.
+bool buildEdgePoints(const std::vector<teaser::PointCloud>& clouds,
+                     const std::vector<std::pair<int, int>>& corr, int p, int q, Pts* p_pts,
+                     Pts* q_pts) {
+  const bool p_is_min = (p < q);
+  p_pts->resize(3, static_cast<Eigen::Index>(corr.size()));
+  q_pts->resize(3, static_cast<Eigen::Index>(corr.size()));
   Eigen::Index col = 0;
   for (const auto& c : corr) {
-    const int p_idx = parent_is_min ? c.first : c.second;  // index into parent cloud
-    const int b_idx = parent_is_min ? c.second : c.first;  // index into child cloud
-    if (p_idx < 0 || p_idx >= static_cast<int>(clouds[parent].size()) || b_idx < 0 ||
-        b_idx >= static_cast<int>(clouds[child].size())) {
+    const int pi = p_is_min ? c.first : c.second;
+    const int qi = p_is_min ? c.second : c.first;
+    if (pi < 0 || pi >= static_cast<int>(clouds[p].size()) || qi < 0 ||
+        qi >= static_cast<int>(clouds[q].size())) {
       continue; // skip malformed correspondence
     }
-    const auto& pp = clouds[parent][p_idx];
-    const auto& bp = clouds[child][b_idx];
-    edge->src.col(col) << pp.x, pp.y, pp.z;
-    edge->dst.col(col) << bp.x, bp.y, bp.z;
+    const auto& pp = clouds[p][pi];
+    const auto& qq = clouds[q][qi];
+    p_pts->col(col) << pp.x, pp.y, pp.z;
+    q_pts->col(col) << qq.x, qq.y, qq.z;
     ++col;
   }
-  edge->src.conservativeResize(3, col);
-  edge->dst.conservativeResize(3, col);
+  p_pts->conservativeResize(3, col);
+  q_pts->conservativeResize(3, col);
   return col > 0;
+}
+
+// Per-edge outlier pruning, mirroring registration.cc: keep the TIMs whose lengths agree to within
+// the noise bound, then take the maximum clique of the graph they induce over correspondences.
+// Returns the surviving correspondence indices, or empty when the edge is unusable.
+std::vector<int> selectCliqueInliers(const Pts& p_tims, const Pts& q_tims,
+                                     const Eigen::Matrix<int, 2, Eigen::Dynamic>& tim_map,
+                                     int num_corr, double beta,
+                                     const teaser::RobustRegistrationSolver::Params& params) {
+  std::vector<int> clique;
+  if (params.inlier_selection_mode ==
+      teaser::RobustRegistrationSolver::INLIER_SELECTION_MODE::NONE) {
+    clique.resize(num_corr);
+    std::iota(clique.begin(), clique.end(), 0);
+    return clique;
+  }
+
+  teaser::Graph inlier_graph;
+  inlier_graph.populateVertices(num_corr);
+  for (Eigen::Index k = 0; k < p_tims.cols(); ++k) {
+    // Scale consistency: a rigid transform preserves TIM length, so a correspondence pair whose
+    // two TIM lengths disagree by more than the noise bound cannot both be inliers.
+    if (std::abs(q_tims.col(k).norm() - p_tims.col(k).norm()) <= beta) {
+      inlier_graph.addEdge(tim_map(0, k), tim_map(1, k));
+    }
+  }
+
+  teaser::MaxCliqueSolver::Params clique_params;
+  switch (params.inlier_selection_mode) {
+  case teaser::RobustRegistrationSolver::INLIER_SELECTION_MODE::PMC_EXACT:
+    clique_params.solver_mode = teaser::MaxCliqueSolver::CLIQUE_SOLVER_MODE::PMC_EXACT;
+    break;
+  case teaser::RobustRegistrationSolver::INLIER_SELECTION_MODE::PMC_HEU:
+    clique_params.solver_mode = teaser::MaxCliqueSolver::CLIQUE_SOLVER_MODE::PMC_HEU;
+    break;
+  default:
+    clique_params.solver_mode = teaser::MaxCliqueSolver::CLIQUE_SOLVER_MODE::KCORE_HEU;
+    break;
+  }
+  clique_params.time_limit = params.max_clique_time_limit;
+  clique_params.kcore_heuristic_threshold = params.kcore_heuristic_threshold;
+  clique_params.num_threads = params.max_clique_num_threads;
+
+  teaser::MaxCliqueSolver clique_solver(clique_params);
+  clique = clique_solver.findMaxClique(inlier_graph);
+  std::sort(clique.begin(), clique.end());
+  return clique;
+}
+
+// Reduce one graph edge to a PreparedEdge. `tim_helper` only supplies computeTIMs, which is a
+// non-static member. Returns false if the edge cannot support a rotation estimate.
+bool prepareEdge(teaser::RobustRegistrationSolver& tim_helper,
+                 const teaser::RobustRegistrationSolver::Params& params, double beta, int p, int q,
+                 double confidence, const Pts& p_all, const Pts& q_all, PreparedEdge* out) {
+  if (p_all.cols() < 3) {
+    return false; // too few correspondences for a TIM-based rotation
+  }
+  Eigen::Matrix<int, 2, Eigen::Dynamic> tim_map, unused_map;
+  const Pts p_tims_all = tim_helper.computeTIMs(p_all, &tim_map);
+  const Pts q_tims_all = tim_helper.computeTIMs(q_all, &unused_map);
+
+  const std::vector<int> clique = selectCliqueInliers(
+      p_tims_all, q_tims_all, tim_map, static_cast<int>(p_all.cols()), beta, params);
+  if (clique.size() < 3) {
+    return false;
+  }
+
+  out->p = p;
+  out->q = q;
+  out->confidence = confidence;
+  out->p_pts.resize(3, static_cast<Eigen::Index>(clique.size()));
+  out->q_pts.resize(3, static_cast<Eigen::Index>(clique.size()));
+  for (size_t k = 0; k < clique.size(); ++k) {
+    out->p_pts.col(static_cast<Eigen::Index>(k)) = p_all.col(clique[k]);
+    out->q_pts.col(static_cast<Eigen::Index>(k)) = q_all.col(clique[k]);
+  }
+  out->p_tims = tim_helper.computeTIMs(out->p_pts, &unused_map);
+  out->q_tims = tim_helper.computeTIMs(out->q_pts, &unused_map);
+  return out->p_tims.cols() > 0;
+}
+
+// GNC-TLS weight update on PRE-NORMALIZED squared residuals (r2 = r^2 / sigma^2). Normalizing up
+// front makes the noise bound 1, so the thresholds are pure functions of mu and one update serves
+// both stages even though their noise bounds differ. Mirrors registration.cc:928-941, including
+// accumulating the cost with the PREVIOUS weights.
+double gncUpdateWeights(const std::vector<RowVec>& r2, double mu, std::vector<RowVec>* w) {
+  const double th1 = (mu + 1) / mu; // above this: outlier, weight 0
+  const double th2 = mu / (mu + 1); // below this: inlier, weight 1
+  double cost = 0;
+  for (size_t e = 0; e < r2.size(); ++e) {
+    for (Eigen::Index j = 0; j < r2[e].cols(); ++j) {
+      cost += (*w)[e](j) * r2[e](j);
+      if (r2[e](j) >= th1) {
+        (*w)[e](j) = 0;
+      } else if (r2[e](j) <= th2) {
+        (*w)[e](j) = 1;
+      } else {
+        (*w)[e](j) = std::sqrt(mu * (mu + 1) / r2[e](j)) - mu;
+      }
+    }
+  }
+  return cost;
+}
+
+// Shared tail of both GNC loops: initialize mu from the largest residual on the first pass, update
+// the weights, anneal, and report whether the cost has converged. Returns false to stop.
+bool gncStep(const std::vector<RowVec>& r2, int iter,
+             const teaser::RobustRegistrationSolver::Params& params, double* mu, double* prev_cost,
+             std::vector<RowVec>* w) {
+  if (iter == 0) {
+    double max_r2 = 0;
+    for (const auto& e : r2) {
+      if (e.cols() > 0) {
+        max_r2 = std::max(max_r2, e.maxCoeff());
+      }
+    }
+    *mu = 1.0 / (2.0 * max_r2 - 1.0);
+    if (*mu <= 0) {
+      return false; // residuals already tiny: the surrogate is the true cost, nothing to anneal
+    }
+  }
+  const double cost = gncUpdateWeights(r2, *mu, w);
+  const double cost_diff = std::abs(cost - *prev_cost);
+  *prev_cost = cost;
+  *mu *= params.rotation_gnc_factor;
+  return cost_diff >= params.rotation_cost_threshold;
 }
 
 // Shared core of the multi-scan drivers. Split the undirected graph edges into connected components
@@ -345,108 +490,201 @@ teaser::MultiScanResult alignAlongGraph(
     }
   }
 
-  // Sweep order: nodes sorted by ref (the caller order, or the BFS discovery order).
-  std::vector<int> proc(N);
-  std::iota(proc.begin(), proc.end(), 0);
-  std::stable_sort(proc.begin(), proc.end(), [&ref](int a, int b) { return ref[a] < ref[b]; });
-
-  // Anchors get the identity pose (and seed the wavefront).
+  // Anchors get the identity pose. An isolated node is its own component's anchor, so it stays
+  // valid with an identity pose, as before.
   std::vector<char> is_anchor(N, 0);
-  std::vector<char> settled(N, 0);
   for (int c = 0; c < result.num_components; ++c) {
     if (anchor[c] >= 0) {
       result.poses[anchor[c]] = teaser::Pose{};
       result.valid[anchor[c]] = true;
       is_anchor[anchor[c]] = 1;
-      settled[anchor[c]] = 1;
     }
   }
 
-  // Wavefront: sweep nodes in ref order to a fixpoint, aligning each not-yet-settled node that has
-  // >= 1 already-posed neighbor to ALL such neighbors. Nodes with no posed neighbor yet are deferred
-  // to a later sweep (BFS fallback from the anchor).
-  teaser::MultiviewSolver solver(params);
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (const int node : proc) {
-      if (settled[node] || is_anchor[node]) {
-        continue;
-      }
-      std::vector<teaser::NeighborEdge> node_edges;
-      std::vector<int> used_parents;
-      for (const int p : adj[node]) {
-        if (!result.valid[p]) {
-          continue; // neighbor not posed yet (or failed)
-        }
-        const auto it = correspondences.find(edge_key(p, node));
-        if (it == correspondences.end() || it->second.empty()) {
-          continue;
-        }
-        teaser::NeighborEdge edge;
-        if (buildNeighborEdge(clouds, it->second, p, node, result.poses[p], &edge)) {
-          const auto wit = edge_weight.find(edge_key(p, node));
-          edge.weight = (wit != edge_weight.end()) ? wit->second : 1.0;
-          node_edges.push_back(std::move(edge));
-          used_parents.push_back(p);
-        }
-      }
-      if (node_edges.empty()) {
-        continue; // no posed neighbor yet -> defer to a later sweep
-      }
+  // ---------- Per-edge preprocessing ----------
+  // Both stages consume the same max-clique-pruned correspondences, so prune once up front.
+  //
+  // The noise bounds are the SYMMETRIC compositions. The pairwise pipeline treats the source cloud
+  // as exact and puts all noise on the destination, hence its factor of 2; here both scans' poses
+  // are unknown and both sides are noisy measurements, so both contribute. Rotation consumes TIMs
+  // (a difference of two points each way, 2*delta per scan); translation consumes raw points
+  // (delta per scan).
+  const double delta = params.noise_bound;
+  const double sqrt_cbar2 = std::sqrt(std::max(0.0, params.cbar2));
+  const double clique_beta = teaser::timResidualNoiseBound(delta, delta) * sqrt_cbar2;
+  const double sigma_rot_sq = std::pow(teaser::timResidualNoiseBound(delta, delta), 2);
+  const double sigma_trans_sq = std::pow(teaser::pointResidualNoiseBound(delta, delta), 2);
 
-      settled[node] = 1; // settled whether or not the solve succeeds
-      changed = true;
+  teaser::RobustRegistrationSolver tim_helper(params); // used only for computeTIMs
+  std::vector<PreparedEdge> prepared;
+  prepared.reserve(edges.size());
+  for (const auto& key : edges) {
+    const auto it = correspondences.find(key);
+    if (it == correspondences.end() || it->second.empty()) {
+      continue;
+    }
+    const auto wit = edge_weight.find(key);
+    const double confidence = (wit != edge_weight.end()) ? wit->second : 1.0;
+    if (!(confidence > 0)) {
+      continue; // a zero-weight edge contributes nothing to either cost
+    }
+    Pts p_all, q_all;
+    if (!buildEdgePoints(clouds, it->second, key.first, key.second, &p_all, &q_all)) {
+      continue;
+    }
+    PreparedEdge pe;
+    if (prepareEdge(tim_helper, params, clique_beta, key.first, key.second, confidence, p_all,
+                    q_all, &pe)) {
+      prepared.push_back(std::move(pe));
+    }
+  }
 
-      const teaser::RegistrationSolution sol = solver.solveNodePose(node_edges);
-      result.poses[node].R = sol.rotation;
-      result.poses[node].t = sol.translation;
-      result.valid[node] = sol.valid;
-      if (!sol.valid) {
-        std::cerr << "[teaser::multiview] Warning: alignment failed for node " << node << ".\n";
-        continue;
+  std::vector<Eigen::Matrix3d> R(N, Eigen::Matrix3d::Identity());
+  std::vector<Eigen::Vector3d> t(N, Eigen::Vector3d::Zero());
+  std::vector<bool> rot_valid(N, false);
+  std::vector<bool> trans_valid(N, false);
+
+  // ---------- Rotation: graph-level GNC-TLS ----------
+  // Every node's rotation is solved at once each iteration, so a loop closure redistributes its
+  // error around the whole cycle instead of dumping it on the last edge, and an edge that
+  // disagrees with the rest of the graph gets down-weighted by their consensus.
+  std::vector<RowVec> w_rot(prepared.size());
+  for (size_t e = 0; e < prepared.size(); ++e) {
+    w_rot[e] = RowVec::Ones(1, prepared[e].p_tims.cols());
+  }
+  {
+    std::vector<RowVec> r2(prepared.size());
+    double mu = 1.0;
+    double prev_cost = std::numeric_limits<double>::infinity();
+    for (size_t iter = 0; iter < params.rotation_max_iterations; ++iter) {
+      std::vector<teaser::RotationSyncEdge> sync_edges(prepared.size());
+      for (size_t e = 0; e < prepared.size(); ++e) {
+        sync_edges[e].p = prepared[e].p;
+        sync_edges[e].q = prepared[e].q;
+        sync_edges[e].p_tims = prepared[e].p_tims;
+        sync_edges[e].q_tims = prepared[e].q_tims;
+        sync_edges[e].w = w_rot[e];
+        // Fold the surviving weight mass into the edge confidence. The line-process weights only
+        // reshape M *within* an edge, and Rhat is M's polar factor, which is invariant to scaling
+        // M -- so without this a uniformly down-weighted edge keeps its full influence on B and the
+        // graph has no way to overrule an edge that is coherently wrong. This is the only channel
+        // that can. (synchronizeTranslations already folds the mass in itself.)
+        sync_edges[e].confidence = prepared[e].confidence * w_rot[e].sum();
       }
+      // Passing the current estimate keeps a node that has just lost all its edges to the weight
+      // update from snapping back to the identity.
+      const teaser::RotationSyncResult sync =
+          teaser::synchronizeRotations(N, sync_edges, teaser::RotationSyncParams(), &R);
+      R = sync.rotations;
+      rot_valid = sync.valid;
 
-      // Per-edge fit quality: mean world-frame residual over each edge's inlier correspondences
-      // (those consistent with the recovered pose within the noise bound).
-      const double inlier_thresh = 2.0 * params.noise_bound * std::sqrt(std::max(0.0, params.cbar2));
-      const teaser::Pose& child_pose = result.poses[node];
-      for (const int p : used_parents) {
-        const auto& corr = correspondences.at(edge_key(p, node));
-        const bool parent_is_min = (p < node);
-        const teaser::Pose& parent_pose = result.poses[p];
-        double residual_sum = 0.0;
-        int inlier_count = 0;
-        for (const auto& c : corr) {
-          const int p_idx = parent_is_min ? c.first : c.second;
-          const int b_idx = parent_is_min ? c.second : c.first;
-          if (p_idx < 0 || p_idx >= static_cast<int>(clouds[p].size()) || b_idx < 0 ||
-              b_idx >= static_cast<int>(clouds[node].size())) {
-            continue;
-          }
-          const auto& pp = clouds[p][p_idx];
-          const auto& bp = clouds[node][b_idx];
-          const Eigen::Vector3d wp =
-              parent_pose.R * Eigen::Vector3d(pp.x, pp.y, pp.z) + parent_pose.t;
-          const Eigen::Vector3d wb = child_pose.R * Eigen::Vector3d(bp.x, bp.y, bp.z) + child_pose.t;
-          const double r = (wp - wb).norm();
-          if (r <= inlier_thresh) {
-            residual_sum += r;
-            ++inlier_count;
-          }
-        }
-        result.edge_residual[edge_key(p, node)] =
-            (inlier_count > 0) ? residual_sum / inlier_count : -1.0;
+      for (size_t e = 0; e < prepared.size(); ++e) {
+        const Pts diff =
+            R[prepared[e].p] * prepared[e].p_tims - R[prepared[e].q] * prepared[e].q_tims;
+        r2[e] = diff.colwise().squaredNorm() / sigma_rot_sq;
+      }
+      if (!gncStep(r2, static_cast<int>(iter), params, &mu, &prev_cost, &w_rot)) {
+        break;
       }
     }
   }
 
-  // Any non-anchor node never reached (no usable path to a posed node) stays invalid.
+  // ---------- Translation: graph-level GNC-TLS, given the rotations ----------
+  std::vector<RowVec> w_trans(prepared.size());
+  for (size_t e = 0; e < prepared.size(); ++e) {
+    w_trans[e] = RowVec::Ones(1, prepared[e].p_pts.cols());
+  }
+  {
+    std::vector<RowVec> r2(prepared.size());
+    double mu = 1.0;
+    double prev_cost = std::numeric_limits<double>::infinity();
+    for (size_t iter = 0; iter < params.rotation_max_iterations; ++iter) {
+      std::vector<teaser::TranslationSyncEdge> sync_edges(prepared.size());
+      for (size_t e = 0; e < prepared.size(); ++e) {
+        sync_edges[e].p = prepared[e].p;
+        sync_edges[e].q = prepared[e].q;
+        sync_edges[e].p_pts = prepared[e].p_pts;
+        sync_edges[e].q_pts = prepared[e].q_pts;
+        sync_edges[e].w = w_trans[e];
+        sync_edges[e].confidence = prepared[e].confidence;
+      }
+      const teaser::TranslationSyncResult sync = teaser::synchronizeTranslations(
+          N, sync_edges, R, teaser::TranslationSyncParams(), &t);
+      t = sync.translations;
+      trans_valid = sync.valid;
+
+      for (size_t e = 0; e < prepared.size(); ++e) {
+        const Pts lhs = (R[prepared[e].p] * prepared[e].p_pts).colwise() + t[prepared[e].p];
+        const Pts rhs = (R[prepared[e].q] * prepared[e].q_pts).colwise() + t[prepared[e].q];
+        r2[e] = (lhs - rhs).colwise().squaredNorm() / sigma_trans_sq;
+      }
+      if (!gncStep(r2, static_cast<int>(iter), params, &mu, &prev_cost, &w_trans)) {
+        break;
+      }
+    }
+  }
+
+  // ---------- Re-gauge to each component's anchor ----------
+  // Both helpers pin their component's lowest-indexed node; the multiview anchor rule may pick a
+  // different one, so re-express every pose in the anchor's frame. The anchor lands on exactly
+  // identity / zero.
+  for (int c = 0; c < result.num_components; ++c) {
+    const int a = anchor[c];
+    if (a < 0) {
+      continue;
+    }
+    const Eigen::Matrix3d Ra = R[a];
+    const Eigen::Vector3d ta = t[a];
+    for (int i = 0; i < N; ++i) {
+      if (result.component[i] != c) {
+        continue;
+      }
+      result.poses[i].R = Ra.transpose() * R[i];
+      result.poses[i].t = Ra.transpose() * (t[i] - ta);
+      result.valid[i] = is_anchor[i] || (rot_valid[i] && trans_valid[i]);
+    }
+  }
   for (int i = 0; i < N; ++i) {
-    if (!settled[i] && !is_anchor[i]) {
+    if (!result.valid[i]) {
       std::cerr << "[teaser::multiview] Warning: node " << i
-                << " could not be aligned (no usable path to an anchor).\n";
+                << " could not be aligned (no usable edge survived).\n";
     }
+  }
+
+  // ---------- Per-edge fit quality ----------
+  // Mean world-frame residual over each edge's inlier correspondences (those consistent with the
+  // recovered poses within the noise bound). Every surviving edge gets an entry now -- with joint
+  // synchronization there is no distinction between tree edges and loop closures.
+  const double inlier_thresh = 2.0 * params.noise_bound * sqrt_cbar2;
+  for (const auto& pe : prepared) {
+    if (!result.valid[pe.p] || !result.valid[pe.q]) {
+      continue;
+    }
+    const auto key = edge_key(pe.p, pe.q);
+    const auto& corr = correspondences.at(key);
+    const bool p_is_min = (pe.p < pe.q);
+    double residual_sum = 0.0;
+    int inlier_count = 0;
+    for (const auto& c : corr) {
+      const int pi = p_is_min ? c.first : c.second;
+      const int qi = p_is_min ? c.second : c.first;
+      if (pi < 0 || pi >= static_cast<int>(clouds[pe.p].size()) || qi < 0 ||
+          qi >= static_cast<int>(clouds[pe.q].size())) {
+        continue;
+      }
+      const auto& pp = clouds[pe.p][pi];
+      const auto& qq = clouds[pe.q][qi];
+      const Eigen::Vector3d wp =
+          result.poses[pe.p].R * Eigen::Vector3d(pp.x, pp.y, pp.z) + result.poses[pe.p].t;
+      const Eigen::Vector3d wq =
+          result.poses[pe.q].R * Eigen::Vector3d(qq.x, qq.y, qq.z) + result.poses[pe.q].t;
+      const double r = (wp - wq).norm();
+      if (r <= inlier_thresh) {
+        residual_sum += r;
+        ++inlier_count;
+      }
+    }
+    result.edge_residual[key] = (inlier_count > 0) ? residual_sum / inlier_count : -1.0;
   }
 
   return result;
@@ -470,7 +708,7 @@ teaser::MultiScanResult teaser::alignMultiScan(
 
   auto edge_key = [](int a, int b) { return std::make_pair(std::min(a, b), std::max(a, b)); };
 
-  // --- 1. Weighted undirected edges (weight supplied by the caller), then MST. ---
+  // --- 1. Weighted undirected edges (weight supplied by the caller). ---
   std::vector<teaser::WeightedEdge> weighted_edges;
   const auto adj = adjacency.getAdjList();
   const int V = std::min<int>(N, static_cast<int>(adj.size()));
@@ -484,22 +722,21 @@ teaser::MultiScanResult teaser::alignMultiScan(
       weighted_edges.push_back({i, j, w});
     }
   }
-  const std::vector<teaser::WeightedEdge> forest =
-      teaser::kruskalSpanningTree(N, weighted_edges, /*maximum=*/true);
-
-  // The MST edges become the propagation tree; anchors are scored by total incident edge weight.
-  std::vector<std::pair<int, int>> forest_edges;
-  forest_edges.reserve(forest.size());
-  for (const auto& e : forest) {
-    forest_edges.push_back({e.u, e.v});
-  }
+  // --- 2. Synchronize over the FULL adjacency graph. ---
+  // No spanning-tree prune: a tree is exactly determined, so synchronizing over one would just
+  // reproduce what sequential propagation already did. Keeping every edge is what lets loop
+  // closures be averaged in. `edge_weights` still only scores anchors -- it is documented as an MST
+  // weight independent of the correspondences, so it is deliberately NOT reused as a cost weight.
+  std::vector<std::pair<int, int>> all_edges;
+  all_edges.reserve(weighted_edges.size());
   std::vector<double> anchor_score(N, 0.0);
   for (const auto& e : weighted_edges) {
+    all_edges.push_back({e.u, e.v});
     anchor_score[e.u] += e.weight;
     anchor_score[e.v] += e.weight;
   }
 
-  return alignAlongGraph(clouds, forest_edges, anchor_score, correspondences, params, /*order=*/{},
+  return alignAlongGraph(clouds, all_edges, anchor_score, correspondences, params, /*order=*/{},
                          /*edge_weight=*/{});
 }
 

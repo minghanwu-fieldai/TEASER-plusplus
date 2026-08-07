@@ -341,8 +341,9 @@ TEST(MultiviewTest, MultiScanConnected) {
     EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
   }
 
-  // One residual entry per MST tree edge (n - 1 for a connected component), all small.
-  EXPECT_EQ(res.edge_residual.size(), 3u);
+  // One residual entry per graph edge, all small. Synchronization uses every edge -- there is no
+  // spanning-tree prune and so no distinction between tree edges and loop closures.
+  EXPECT_EQ(res.edge_residual.size(), 4u);
   for (const auto& kv : res.edge_residual) {
     EXPECT_GE(kv.second, 0.0);
     EXPECT_LT(kv.second, 1e-2);
@@ -580,6 +581,131 @@ TEST(MultiviewTest, MultiScanGraphZeroWeightEdge) {
     EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
     EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
   }
+}
+
+namespace {
+
+// Rigidly rotate the points of `node` that belong to edge `key`. Because buildScene appends fresh
+// points per edge, this touches only that edge's correspondences: the edge stays internally
+// consistent (it is a rigid transform) but now disagrees with the rest of the graph. Exactly the
+// case per-edge robustness cannot see -- the edge looks perfect on its own evidence.
+void perturbEdgePoints(Scene* scene, const std::pair<int, int>& key, int node,
+                       const Eigen::Matrix3d& delta) {
+  const bool node_is_first = (node == key.first);
+  for (const auto& c : scene->corr.at(key)) {
+    const int idx = node_is_first ? c.first : c.second;
+    auto& pt = scene->clouds[node][idx];
+    const Eigen::Vector3d v =
+        delta * Eigen::Vector3d(static_cast<double>(pt.x), static_cast<double>(pt.y),
+                                static_cast<double>(pt.z));
+    pt.x = static_cast<float>(v.x());
+    pt.y = static_cast<float>(v.y());
+    pt.z = static_cast<float>(v.z());
+  }
+}
+
+} // namespace
+
+// Joint synchronization spreads a cycle's inconsistency over all of its edges. Sequential
+// propagation could not: it fixed each pose on arrival, so the closing edge absorbed the entire
+// accumulated error while the chain edges fit ~exactly. Here the inconsistency is small enough
+// that GNC keeps every correspondence, so this isolates the estimator, not the robustness.
+TEST(MultiviewTest, LoopClosureErrorIsDistributed) {
+  auto gt = fourPoseGt();
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {0, 3}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/0);
+
+  // Make the cycle fail to close by a small rigid twist on one edge only.
+  perturbEdgePoints(&scene, {0, 3}, 0, makeRotation(0.3, 0.7, -0.2, 0.01));
+
+  auto res = teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(0.05));
+
+  ASSERT_EQ(res.num_components, 1);
+  ASSERT_EQ(res.edge_residual.size(), 4u);
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_TRUE(res.valid[n]);
+  }
+
+  // Every edge carries part of the error. Under propagation the three chain edges would fit to
+  // ~1e-9 and only the closure edge would show anything, so a nonzero minimum is the signature of
+  // a joint solve.
+  double min_res = std::numeric_limits<double>::infinity();
+  double max_res = 0.0;
+  for (const auto& kv : res.edge_residual) {
+    ASSERT_GE(kv.second, 0.0);
+    min_res = std::min(min_res, kv.second);
+    max_res = std::max(max_res, kv.second);
+  }
+  EXPECT_GT(min_res, 1e-3) << "closure error was dumped on one edge instead of being distributed";
+  EXPECT_LT(max_res, 5e-2);
+
+  // Baseline showing what "dumped on one edge" looks like: drop the closure edge and the chain is
+  // exactly determined, so its three edges fit to ~0 and all the inconsistency would have to land
+  // on the edge that was left out. That is precisely what sequential propagation produced, and the
+  // gap between ~1e-9 here and >1e-3 above is the whole point of solving jointly.
+  const std::vector<std::pair<int, int>> chain = {{0, 1}, {1, 2}, {2, 3}};
+  auto chain_res =
+      teaser::alignMultiScanWithGraph(scene.clouds, chain, scene.corr, makeParams(0.05));
+  ASSERT_EQ(chain_res.edge_residual.size(), 3u);
+  for (const auto& kv : chain_res.edge_residual) {
+    EXPECT_LT(kv.second, 1e-6) << "edge (" << kv.first.first << "," << kv.first.second << ")";
+  }
+}
+
+// A poisoned edge that survives max-clique -- its correspondences are a rigid transform of each
+// other, so they are mutually consistent and the clique keeps all of them -- but that transform is
+// badly wrong. Only graph-level consensus can reject it; per-edge robustness sees a perfect edge.
+TEST(MultiviewTest, GraphConsensusRejectsPoisonedEdge) {
+  auto gt = fourPoseGt();
+  // A 4-cycle (enough on its own to fix every pose) plus a diagonal that we poison.
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {0, 3}, {0, 2}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/0);
+
+  perturbEdgePoints(&scene, {0, 2}, 0, makeRotation(0.4, -0.6, 0.5, 0.3));
+
+  auto res = teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3));
+
+  ASSERT_EQ(res.num_components, 1);
+  const int anchor = 0; // ties on degree resolve to the smallest index
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_TRUE(res.valid[n]);
+    const Eigen::Matrix3d R_rel = gt[anchor].R.transpose() * gt[n].R;
+    const Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
+    EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2) << "node " << n;
+    EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2) << "node " << n;
+  }
+
+  // The four clean edges end up fitting essentially exactly, which they could not if the poisoned
+  // edge still had a say. The poisoned edge itself is either fully rejected (-1: it retained no
+  // inlier correspondence at all) or visibly the worst fit.
+  const double poisoned = res.edge_residual.at({0, 2});
+  for (const auto& kv : res.edge_residual) {
+    if (kv.first == std::make_pair(0, 2)) {
+      continue;
+    }
+    EXPECT_LT(kv.second, 1e-5) << "edge (" << kv.first.first << "," << kv.first.second << ")";
+  }
+  EXPECT_TRUE(poisoned < 0.0 || poisoned > 1e-2) << "poisoned edge residual " << poisoned;
+}
+
+// The eigensolver gauge is pinned and every stage is deterministic, so repeated runs must agree
+// exactly -- not just to a tolerance.
+TEST(MultiviewTest, RepeatedRunsAreIdentical) {
+  auto gt = fourPoseGt();
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {0, 3}, {0, 2}};
+  auto scene = buildScene(gt, graph, /*k_in=*/25, /*k_out=*/5);
+
+  auto a = teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3));
+  auto b = teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3));
+
+  ASSERT_EQ(a.num_components, b.num_components);
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_EQ(a.valid[n], b.valid[n]);
+    EXPECT_EQ(a.component[n], b.component[n]);
+    EXPECT_TRUE(a.poses[n].R.isApprox(b.poses[n].R, 0.0)) << "node " << n;
+    EXPECT_TRUE(a.poses[n].t.isApprox(b.poses[n].t, 0.0)) << "node " << n;
+  }
+  EXPECT_EQ(a.edge_residual, b.edge_residual);
 }
 
 // Degenerate input (too few correspondences) is reported as invalid.

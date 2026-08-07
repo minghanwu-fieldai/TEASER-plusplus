@@ -53,6 +53,9 @@ add_library(teaser_registration
         src/registration.cc
         src/graph.cc
         src/multiview.cc
+        src/rotation_sync.cc
+        src/sync_components.cc
+        src/translation_sync.cc
 )
 
 target_link_libraries(teaser_registration

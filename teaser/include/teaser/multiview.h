@@ -143,12 +143,12 @@ struct MultiScanResult {
   /** Connected-component id per node (nodes in the same component share a gauge). */
   std::vector<int> component;
   /**
-   * Per-edge fit quality: for each graph/tree edge actually used during alignment (keyed by
-   * (min(i,j), max(i,j))), the mean world-frame residual over that edge's inlier correspondences
-   * (those whose post-alignment residual is within the noise bound). A multi-parent node
-   * contributes one entry per incoming edge. The value is -1 for a used edge that has no inliers.
-   * Edges not used (unaligned nodes, anchors' outgoing side, or pruned by the MST path) have no
-   * entry.
+   * Per-edge fit quality, keyed by (min(i,j), max(i,j)): the mean world-frame residual over that
+   * edge's inlier correspondences (those whose post-alignment residual is within the noise bound).
+   * Every edge that survived preprocessing gets an entry -- joint synchronization uses them all, so
+   * there is no tree-edge / loop-closure distinction. The value is -1 for an edge that retained no
+   * inliers, which is what a rejected edge looks like. Edges with no correspondences, too few to
+   * survive the max-clique prune, or whose endpoints could not be aligned have no entry.
    */
   std::map<std::pair<int, int>, double> edge_residual;
   /** Number of connected components found in the adjacency graph. */
@@ -158,16 +158,20 @@ struct MultiScanResult {
 /**
  * Align a set of overlapping scans into a common frame per connected component.
  *
- * Pipeline: build a maximum spanning tree over the adjacency graph using the caller-supplied
- * edge weights; split into connected components (a warning is emitted if there is more than one);
- * within each component pick the node with the largest total edge weight as the anchor (identity
- * pose) and propagate poses outward along the tree in topological order, aligning each child to
- * its single tree-parent via teaser::MultiviewSolver::solveNodePose.
+ * Pipeline: split the adjacency graph into connected components (a warning is emitted if there is
+ * more than one); within each component pick the node with the largest total edge weight as the
+ * anchor (identity pose); then solve ALL poses at once by rotation synchronization followed by
+ * translation synchronization, both driven by a graph-level GNC-TLS loop over the
+ * max-clique-pruned correspondences.
  *
- * The MST edge weight is provided by the caller and is independent of the correspondences, so the
- * tree can be chosen from any proxy (overlap, proximity, keypoint count, ...). Because propagation
- * uses tree edges only, correspondences are consulted for tree edges only -- the caller may supply
- * them for just those edges if the tree is known in advance.
+ * Every adjacency edge participates -- there is no spanning-tree prune, because a tree is exactly
+ * determined and synchronizing over one would merely reproduce sequential propagation. Keeping
+ * every edge is what lets a loop closure spread its error around the cycle instead of dumping it on
+ * one edge, and lets the rest of the graph out-vote an edge that is coherently wrong.
+ *
+ * `edge_weights` is documented as a spanning-tree weight independent of the correspondences, so it
+ * is used ONLY to score anchors -- it is deliberately not reused as a per-edge cost weight. Use
+ * alignMultiScanWithGraph if you want caller-supplied weights to influence the solve.
  *
  * Correspondences are the raw putative matches (outliers included); the per-edge robust solve
  * performs its own inlier selection.
@@ -190,23 +194,18 @@ MultiScanResult alignMultiScan(
 /**
  * Align a set of overlapping scans given a caller-provided graph (MST step skipped).
  *
- * Identical to alignMultiScan except that the graph is supplied directly instead of being computed
- * via a maximum spanning tree. The graph may or may not be a tree: `graph_edges` are undirected
- * `(i, j)` pairs (duplicates ignored). Connected components are derived from the edges, and each
- * component's anchor (its root) is the highest-degree node (ties -> smallest index). The root is
- * used to run a BFS that assigns a discovery order; every edge is then oriented from the
- * earlier-discovered endpoint (parent) to the later one (child). Because that orientation follows a
- * total order it is always acyclic, so loop-closure edges are kept rather than pruned: a node with
- * several in-edges is aligned to ALL of its already-posed parents at once (the multi-edge
- * aggregation from multiview.md). The returned gauge (per-component identity anchor) matches
+ * Identical to alignMultiScan except that the graph is supplied directly. `graph_edges` are
+ * undirected `(i, j)` pairs (duplicates ignored); the graph may or may not be a tree. Connected
+ * components are derived from the edges, and each component's anchor is the highest-degree node
+ * (ties -> smallest index). Every edge participates in the joint solve, so loop closures are
+ * averaged in rather than pruned. The returned gauge (per-component identity anchor) matches
  * alignMultiScan.
  *
- * Optionally the caller can pass `order`, a topological order of the scans (root-most first). When
- * non-empty it replaces the automatic reference: it decides each component's anchor (the earliest
- * listed node in the component), the edge directions (earlier in the order = parent), and the order
- * in which nodes are aligned. Nodes absent from a non-empty `order` are ranked after all listed
- * ones. A node whose neighbors are all later in the order is still aligned once one of them is posed
- * (BFS fallback), so an order inconsistent with the graph never leaves nodes unaligned.
+ * Optionally the caller can pass `order`, a preference order over the scans (root-most first).
+ * Because all poses are now solved simultaneously there is no propagation sequence left for it to
+ * control, so it does exactly one thing: it selects each component's anchor, namely the earliest
+ * listed node in that component. Nodes absent from a non-empty `order` rank after all listed ones.
+ * Since the anchor only fixes the gauge, an order inconsistent with the graph is harmless.
  *
  * @param clouds [in] clouds[i] is scan i (points in scan i's local frame)
  * @param graph_edges [in] undirected graph edges over vertices 0..clouds.size()-1 (tree or not)
