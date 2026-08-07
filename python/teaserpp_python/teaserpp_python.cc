@@ -105,9 +105,15 @@ PYBIND11_MODULE(_teaserpp, m) {
            py::arg("max_clique_time_limit") = 3000,
            py::arg("max_clique_num_threads") = omp_get_max_threads())
       .def("getParams", &teaser::RobustRegistrationSolver::getParams)
-      .def("solve", py::overload_cast<const Eigen::Matrix<double, 3, Eigen::Dynamic>&,
-                                      const Eigen::Matrix<double, 3, Eigen::Dynamic>&>(
-                        &teaser::RobustRegistrationSolver::solve))
+      // Note: solve() takes a third, defaulted corr_weights argument, so overload_cast on the two
+      // Eigen types alone does not resolve. Bind the full signature and give corr_weights a Python
+      // default of [] (unweighted), preserving the two-argument call.
+      .def("solve",
+           static_cast<teaser::RegistrationSolution (teaser::RobustRegistrationSolver::*)(
+               const Eigen::Matrix<double, 3, Eigen::Dynamic>&,
+               const Eigen::Matrix<double, 3, Eigen::Dynamic>&, const std::vector<double>&)>(
+               &teaser::RobustRegistrationSolver::solve),
+           py::arg("src"), py::arg("dst"), py::arg("corr_weights") = std::vector<double>())
 
       .def_property_readonly("solution", &teaser::RobustRegistrationSolver::getSolution)
       .def("getSolution", &teaser::RobustRegistrationSolver::getSolution)
@@ -202,6 +208,23 @@ PYBIND11_MODULE(_teaserpp, m) {
                      &teaser::RobustRegistrationSolver::Params::max_clique_exact_solution)
       .def_readwrite("max_clique_time_limit",
                      &teaser::RobustRegistrationSolver::Params::max_clique_time_limit)
+      .def_readwrite("rotation_tilt_prior_eta",
+                     &teaser::RobustRegistrationSolver::Params::rotation_tilt_prior_eta)
+      // Note: def_property rather than def_readwrite for the Eigen members. def_readwrite would
+      // hand back a numpy copy, so in-place element assignment (params.rotation_up_src[2] = 1)
+      // would silently not stick.
+      .def_property(
+          "rotation_up_src",
+          [](const teaser::RobustRegistrationSolver::Params& p) { return p.rotation_up_src; },
+          [](teaser::RobustRegistrationSolver::Params& p, const Eigen::Vector3d& v) {
+            p.rotation_up_src = v;
+          })
+      .def_property(
+          "rotation_up_dst",
+          [](const teaser::RobustRegistrationSolver::Params& p) { return p.rotation_up_dst; },
+          [](teaser::RobustRegistrationSolver::Params& p, const Eigen::Vector3d& v) {
+            p.rotation_up_dst = v;
+          })
       .def("__repr__", [](const teaser::RobustRegistrationSolver::Params& a) {
         std::ostringstream print_string;
 

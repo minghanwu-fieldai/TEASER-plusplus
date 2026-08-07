@@ -9,6 +9,7 @@
 #pragma once
 
 #include <memory>
+#include <stdexcept>
 #include <vector>
 #include <tuple>
 
@@ -229,6 +230,73 @@ public:
     double cost_threshold;
     double gnc_factor;
     double noise_bound;
+
+    /**
+     * \brief Strength of an optional soft penalty on pitch/roll (tilt), leaving yaw free.
+     *
+     * The penalty added to the rotation cost is
+     *   lambda * ||up_dst - R * up_src||^2 = 2 * lambda * (1 - up_dst^T R up_src),
+     * which for the default up_src = up_dst = z_hat equals 2*lambda*(1 - R(2,2)) =
+     * 2*lambda*(1 - cos(pitch)*cos(roll)) ~= lambda*(pitch^2 + roll^2) for small angles. It has
+     * no yaw dependence at all.
+     *
+     * lambda is derived from this parameter as
+     *   lambda = tilt_prior_eta * sum_j w_j * ||src_j||^2,
+     * i.e. tilt_prior_eta * N * L^2 where N is the effective inlier count at the current GNC
+     * iteration and L their RMS length (w_j being the line-process weights times any
+     * per-correspondence prior weights -- exactly the measurement mass present in the weighted
+     * Wahba correlation matrix). tilt_prior_eta is therefore the weight of the prior relative to
+     * the measurements that currently survive, and is invariant to point-cloud scale, to
+     * correspondence count, and to how many correspondences GNC has rejected so far.
+     *
+     * Set to 0 (the default) to disable the prior entirely, which reproduces the unpenalized
+     * solver exactly. 0.5 is a reasonable value when enabling it. Must be >= 0; a negative value
+     * causes solveForRotation to throw std::invalid_argument.
+     *
+     * \attention lambda is recomputed every iteration against the *current* weights, not fixed
+     * from the initial correspondence set. This matters because the prior necessarily increases
+     * residuals (it pulls the rotation off the least-squares fit), and GNC rejects a
+     * correspondence once its residual exceeds the noise bound. With a fixed lambda that is a
+     * runaway: rejecting measurements shrinks sum(w) while lambda stays put, so the prior's
+     * relative pull grows, rejecting more of them, until every weight is zero and the rotation is
+     * determined by the prior alone. Scaling lambda with the surviving mass holds the prior's
+     * relative strength at exactly tilt_prior_eta throughout, which removes that positive
+     * feedback.
+     *
+     * \attention The flip side is that the iteration no longer minimizes one fixed objective --
+     * lambda changes with the weights -- so the exact penalized-least-squares reading only holds
+     * for a single R-step. In practice the sequence still settles; the first iteration (all
+     * weights 1) is exactly eta * N * L^2 over the full input.
+     *
+     * \attention eta is a *relative* strength, so it does not by itself bound how far the rotation
+     * moves. A correction of Dphi radians costs about (L*Dphi)^2 per correspondence, so demanding a
+     * large tilt correction under a tight noise_bound still means the fit will sit outside the
+     * noise bound. Widen noise_bound, or use QUATRO if the intent is a hard yaw-only constraint.
+     *
+     * \attention Ignored by QuatroSolver, which estimates yaw only and therefore already has
+     * zero pitch and roll by construction.
+     */
+    double tilt_prior_eta = 0.0;
+
+    /**
+     * \brief Up axis in the src frame, used only when tilt_prior_eta > 0. Normalized internally.
+     *
+     * Leaving up_src equal to up_dst (the default) penalizes tilt away from zero. Setting them to
+     * differing directions (e.g. a per-frame IMU gravity estimate) instead penalizes deviation
+     * from that known relative tilt.
+     *
+     * \attention The symmetric case (up_src == up_dst) is invariant to transposing R, since
+     * R(2,2) == R^T(2,2), so it is safe through code paths that internally solve for R^T (such as
+     * the multiview solver). The asymmetric case is NOT transpose-invariant and should only be
+     * used where the src/dst convention of the rotation solver is known directly.
+     */
+    Eigen::Vector3d up_src = Eigen::Vector3d::UnitZ();
+
+    /**
+     * \brief Up axis in the dst frame, used only when tilt_prior_eta > 0. Normalized internally.
+     * See up_src.
+     */
+    Eigen::Vector3d up_dst = Eigen::Vector3d::UnitZ();
   };
 
   GNCRotationSolver(Params params) : params_(params) {}
@@ -518,6 +586,39 @@ public:
      * Number of threads used for the maximum clique solver
      */
     int max_clique_num_threads = teaser_default_max_threads();
+
+    // NOTE: fields below are not reachable through the positional constructor / reset() overload,
+    // which brace-initializes this struct with the 14 fields above. Keep new fields at the end so
+    // that positional initialization keeps working.
+
+    /**
+     * \brief Strength of an optional soft penalty on pitch/roll in the GNC rotation solvers,
+     * leaving yaw free. 0 (the default) disables it; 0.5 is a reasonable value when enabling it.
+     * Must be >= 0, otherwise reset() throws std::invalid_argument.
+     *
+     * Forwarded to GNCRotationSolver::Params::tilt_prior_eta; see that field for the full
+     * definition and caveats. eta is the prior's weight relative to the measurement mass surviving
+     * at the current GNC iteration, so it holds that relative strength as outliers are annealed
+     * away. Honored by GNC_TLS and FGR; ignored by QUATRO, which estimates yaw only.
+     *
+     * \attention Note the rotation solver runs on TIMs, whose noise bound is the point noise bound
+     * scaled by 2/scale, and whose count is the pruned TIM count (k(k-1)/2 for a complete graph
+     * over a clique of k). eta is normalized by that measurement mass, so it stays comparable
+     * across both graph formulations.
+     */
+    double rotation_tilt_prior_eta = 0.0;
+
+    /**
+     * \brief Up axis in the src frame for the tilt prior. Forwarded to
+     * GNCRotationSolver::Params::up_src.
+     */
+    Eigen::Vector3d rotation_up_src = Eigen::Vector3d::UnitZ();
+
+    /**
+     * \brief Up axis in the dst frame for the tilt prior. Forwarded to
+     * GNCRotationSolver::Params::up_dst.
+     */
+    Eigen::Vector3d rotation_up_dst = Eigen::Vector3d::UnitZ();
   };
 
   RobustRegistrationSolver() = default;
@@ -835,6 +936,9 @@ public:
    * @param params a Params struct
    */
   void reset(const Params& params) {
+    if (params.rotation_tilt_prior_eta < 0.0) {
+      throw std::invalid_argument("teaser: rotation_tilt_prior_eta must be >= 0");
+    }
     params_ = params;
     // Initialize the scale estimator
     if (params_.estimate_scaling) {
@@ -849,6 +953,9 @@ public:
     teaser::GNCRotationSolver::Params rotation_params{
         params_.rotation_max_iterations, params_.rotation_cost_threshold,
         params_.rotation_gnc_factor, params_.noise_bound};
+    rotation_params.tilt_prior_eta = params_.rotation_tilt_prior_eta;
+    rotation_params.up_src = params_.rotation_up_src;
+    rotation_params.up_dst = params_.rotation_up_dst;
 
     switch (params_.rotation_estimation_algorithm) {
     case ROTATION_ESTIMATION_ALGORITHM::GNC_TLS: { // GNC-TLS method

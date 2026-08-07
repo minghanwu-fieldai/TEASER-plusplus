@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <iterator>
+#include <stdexcept>
 
 #include <omp.h>
 
@@ -23,6 +24,99 @@
 int teaser::teaser_default_max_threads() {
  return omp_get_max_threads();
 }
+
+namespace {
+
+/**
+ * Precomputed soft tilt (pitch/roll) prior for the GNC rotation solvers.
+ *
+ * The prior is expressible as a single extra weighted Wahba correspondence, because
+ *   lambda * ||u_dst - R * u_src||^2 = 2 * lambda * (1 - u_dst^T R u_src),
+ * and for u_src = u_dst = z_hat that is 2*lambda*(1 - R(2,2)) = 2*lambda*(1 - cos(pitch)cos(roll)),
+ * i.e. ~ lambda*(pitch^2 + roll^2) for small angles, with no yaw dependence at all. Appending that
+ * pair adds the rank-1 term lambda * u_src * u_dst^T to the correlation matrix H that
+ * teaser::utils::svdRot builds internally, so the closed-form SVD solution is preserved exactly and
+ * svdRot itself needs no modification.
+ */
+struct TiltPrior {
+  bool active = false;
+  double eta = 0.0;
+  /// Per-input squared norms ||src_j||^2, cached so lambda is one dot product per iteration.
+  Eigen::Matrix<double, 1, Eigen::Dynamic> sq_norms;
+  Eigen::Vector3d u_src = Eigen::Vector3d::UnitZ();
+  Eigen::Vector3d u_dst = Eigen::Vector3d::UnitZ();
+
+  /**
+   * lambda = eta * sum_j w_j * ||src_j||^2, i.e. eta * N * L^2 evaluated over the measurement mass
+   * that is actually present in H at this iteration (N the effective inlier count, L their RMS
+   * length). Recomputed per iteration so eta keeps meaning "the prior's weight relative to the
+   * surviving measurements" as GNC anneals outliers away, rather than relative to the initial set.
+   */
+  double lambda(const Eigen::Matrix<double, 1, Eigen::Dynamic>& weights) const {
+    return eta * (weights.array() * sq_norms.array()).sum();
+  }
+};
+
+/**
+ * Validate the tilt-prior params and cache what lambda needs.
+ *
+ * @throws std::invalid_argument if eta < 0, or if an up vector is degenerate while eta > 0.
+ */
+TiltPrior makeTiltPrior(const teaser::GNCRotationSolver::Params& params,
+                        const Eigen::Matrix<double, 3, Eigen::Dynamic>& src) {
+  if (params.tilt_prior_eta < 0.0) {
+    throw std::invalid_argument("teaser: tilt_prior_eta must be >= 0");
+  }
+  TiltPrior tp;
+  if (params.tilt_prior_eta == 0.0 || src.cols() == 0) {
+    // Disabled: callers fall back to the unpenalized svdRot path, bit for bit.
+    return tp;
+  }
+  if (params.up_src.norm() < 1e-12 || params.up_dst.norm() < 1e-12) {
+    throw std::invalid_argument(
+        "teaser: tilt prior up_src/up_dst must be nonzero when tilt_prior_eta > 0");
+  }
+  tp.eta = params.tilt_prior_eta;
+  tp.sq_norms = src.colwise().squaredNorm();
+  tp.u_src = params.up_src.normalized();
+  tp.u_dst = params.up_dst.normalized();
+  tp.active = true;
+  return tp;
+}
+
+/**
+ * The GNC R-step (weighted Wahba / orthogonal Procrustes) with the tilt prior folded in as one
+ * extra weighted correspondence. Falls through to plain svdRot when the prior is disabled.
+ *
+ * `weights` must be the same effective weight vector that goes into H (GNC line-process weights
+ * times any per-correspondence prior weights), since lambda is scaled by that same mass.
+ *
+ * Note the prior deliberately participates ONLY here. It must not enter the residuals, the mu
+ * initialization, the reported cost, or the inlier mask: it is a prior, not a measurement, so
+ * letting GNC see it would let the annealing truncate it to zero weight, and letting it reach the
+ * inlier mask would desynchronize that mask from the caller's correspondence count.
+ */
+Eigen::Matrix3d svdRotWithTiltPrior(const Eigen::Matrix<double, 3, Eigen::Dynamic>& src,
+                                    const Eigen::Matrix<double, 3, Eigen::Dynamic>& dst,
+                                    const Eigen::Matrix<double, 1, Eigen::Dynamic>& weights,
+                                    const TiltPrior& tp) {
+  const double lambda = tp.active ? tp.lambda(weights) : 0.0;
+  if (lambda <= 0.0) {
+    // Either disabled, or every measurement weight has collapsed -- in which case the prior scales
+    // to nothing too and there is no rank-1 term to add.
+    return teaser::utils::svdRot(src, dst, weights);
+  }
+  const Eigen::Index N = src.cols();
+  Eigen::Matrix<double, 3, Eigen::Dynamic> src_aug(3, N + 1);
+  Eigen::Matrix<double, 3, Eigen::Dynamic> dst_aug(3, N + 1);
+  Eigen::Matrix<double, 1, Eigen::Dynamic> w_aug(1, N + 1);
+  src_aug << src, tp.u_src;
+  dst_aug << dst, tp.u_dst;
+  w_aug << weights, lambda;
+  return teaser::utils::svdRot(src_aug, dst_aug, w_aug);
+}
+
+} // namespace
 
 void teaser::ScalarTLSEstimator::estimate(const Eigen::RowVectorXd& X,
                                           const Eigen::RowVectorXd& ranges, double* estimate,
@@ -255,6 +349,10 @@ void teaser::FastGlobalRegistrationSolver::solveForRotation(
     prior = Eigen::Matrix<double, 1, Eigen::Dynamic>::Ones(1, match_size);
   }
 
+  // Optional soft penalty on pitch/roll (see TiltPrior). Computed once: it depends only on the
+  // params and on the input magnitudes, not on the current rotation estimate.
+  const TiltPrior tilt_prior = makeTiltPrior(params_, src);
+
   // Assumptions of the two inputs:
   // they should be of the same scale,
   // outliers should be removed as much as possible
@@ -273,7 +371,7 @@ void teaser::FastGlobalRegistrationSolver::solveForRotation(
     }
 
     // 2. Optimize for Rotation Matrix (line-process weights scaled by the prior)
-    *rotation = teaser::utils::svdRot(src, dst, l_pq.cwiseProduct(prior));
+    *rotation = svdRotWithTiltPrior(src, dst, l_pq.cwiseProduct(prior), tilt_prior);
 
     // update cost
     Eigen::Matrix<double, 3, Eigen::Dynamic> diff = (dst - (*rotation) * src).array().square();
@@ -294,6 +392,13 @@ void teaser::FastGlobalRegistrationSolver::solveForRotation(
     mu /= params_.gnc_factor;
   }
 
+  // See the equivalent note in GNCTLSRotationSolver::solveForRotation. FGR's Geman-McClure weights
+  // decay smoothly rather than truncating, so this effectively never fires.
+  if (tilt_prior.active && l_pq.maxCoeff() < 1e-12) {
+    TEASER_INFO_MSG("teaser: WARNING - every correspondence weight collapsed to zero, so the "
+                    "estimated rotation is unconstrained.\n");
+  }
+
   if (inliers) {
     *inliers = l_pq.cast<bool>();
   }
@@ -311,6 +416,16 @@ void teaser::QuatroSolver::solveForRotation(
   if (inliers) {
     assert(inliers->cols() == src.cols());
   }
+  if (params_.tilt_prior_eta < 0.0) {
+    throw std::invalid_argument("teaser: tilt_prior_eta must be >= 0");
+  }
+  if (params_.tilt_prior_eta > 0.0) {
+    // Quatro estimates yaw only, so pitch and roll are already identically zero and a soft tilt
+    // penalty has nothing to act on.
+    TEASER_DEBUG_INFO_MSG("Quatro ignores tilt_prior_eta: SO(2) yaw-only estimation already has "
+                          "zero pitch and roll.");
+  }
+
   // Initialization
   *rotation = Eigen::Matrix3d::Identity();
 
@@ -902,11 +1017,15 @@ void teaser::GNCTLSRotationSolver::solveForRotation(
     prior = Eigen::Matrix<double, 1, Eigen::Dynamic>::Ones(1, match_size);
   }
 
+  // Optional soft penalty on pitch/roll (see TiltPrior). Computed once: it depends only on the
+  // params and on the input magnitudes, not on the current rotation estimate.
+  const TiltPrior tilt_prior = makeTiltPrior(params_, src);
+
   // Loop for performing GNC-TLS
   for (size_t i = 0; i < params_.max_iterations; ++i) {
 
     // Fix weights and perform SVD rotation estimation (line-process weights scaled by the prior)
-    *rotation = teaser::utils::svdRot(src, dst, weights.cwiseProduct(prior));
+    *rotation = svdRotWithTiltPrior(src, dst, weights.cwiseProduct(prior), tilt_prior);
 
     // Calculate residuals squared
     diffs = (dst - (*rotation) * src).array().square();
@@ -956,6 +1075,17 @@ void teaser::GNCTLSRotationSolver::solveForRotation(
       TEASER_DEBUG_INFO_MSG("Iterations: " << i);
       break;
     }
+  }
+
+  // If every measurement weight collapses to zero the correlation matrix is empty and the returned
+  // rotation is meaningless. Because lambda scales with the surviving measurement mass, the prior
+  // cannot drive this on its own (it vanishes along with the data) -- it means noise_bound is too
+  // tight for the residuals, so warn rather than report the rotation silently.
+  if (tilt_prior.active && weights.maxCoeff() < 1e-12) {
+    TEASER_INFO_MSG("teaser: WARNING - every GNC weight collapsed to zero, so the estimated "
+                    "rotation is unconstrained. The tilt prior scales with the surviving "
+                    "measurement mass and vanished with it; this indicates noise_bound is too "
+                    "tight for the data.\n");
   }
 
   if (inliers) {
