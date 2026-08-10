@@ -63,6 +63,14 @@ teaser::RobustRegistrationSolver::Params makeParams(double noise_bound) {
   return params;
 }
 
+// Same params, but running the sequential-propagation solver instead of the default spectral one.
+teaser::RobustRegistrationSolver::Params makePropagationParams(double noise_bound) {
+  auto params = makeParams(noise_bound);
+  params.multiview_method =
+      teaser::RobustRegistrationSolver::MULTIVIEW_METHOD::DAG_PROPAGATION;
+  return params;
+}
+
 // A synthetic multi-scan scene: clouds, adjacency, per-edge correspondences, and GT global poses.
 struct Scene {
   std::vector<teaser::PointCloud> clouds;
@@ -706,6 +714,102 @@ TEST(MultiviewTest, RepeatedRunsAreIdentical) {
     EXPECT_TRUE(a.poses[n].t.isApprox(b.poses[n].t, 0.0)) << "node " << n;
   }
   EXPECT_EQ(a.edge_residual, b.edge_residual);
+}
+
+// ======================= MULTIVIEW_METHOD::DAG_PROPAGATION =======================
+// The two methods are different optimizations, so these pin propagation's own behavior rather than
+// re-checking the spectral assertions above.
+
+// Propagation still recovers a connected scene, and alignMultiScan still prunes to the maximum
+// spanning tree for it -- so edge_residual has one entry per TREE edge (n-1), not per graph edge.
+// This is the assertion that had to change when spectral became the default.
+TEST(MultiviewTest, PropagationMultiScanConnected) {
+  auto gt = fourPoseGt();
+  std::vector<std::pair<int, int>> edges = {{0, 1}, {1, 2}, {2, 3}, {0, 2}};
+  auto scene = buildScene(gt, edges, /*k_in=*/30, /*k_out=*/8);
+
+  auto res = teaser::alignMultiScan(scene.clouds, scene.adjacency, scene.edge_weights, scene.corr,
+                                    makePropagationParams(1e-3));
+
+  ASSERT_EQ(res.num_components, 1);
+  const int anchor = 2; // most incident edge weight
+  EXPECT_TRUE(res.poses[anchor].R.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_TRUE(res.valid[n]);
+    Eigen::Matrix3d R_rel = gt[anchor].R.transpose() * gt[n].R;
+    Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
+    EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
+    EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
+  }
+  // MST edges only: 3, versus 4 for the spectral path on the same graph.
+  EXPECT_EQ(res.edge_residual.size(), 3u);
+}
+
+// On a noiseless, globally consistent scene there is nothing for a joint solve to redistribute, so
+// both methods must land on the same answer. This is the check that the two paths agree wherever
+// they are both correct -- any divergence here means one of them is simply wrong.
+TEST(MultiviewTest, BothMethodsAgreeOnConsistentScene) {
+  auto gt = fourPoseGt();
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {0, 3}, {0, 2}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/0);
+
+  auto spectral =
+      teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3));
+  auto propagation = teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr,
+                                                     makePropagationParams(1e-3));
+
+  ASSERT_EQ(spectral.num_components, 1);
+  ASSERT_EQ(propagation.num_components, 1);
+  for (int n = 0; n < 4; ++n) {
+    ASSERT_TRUE(spectral.valid[n]) << "spectral node " << n;
+    ASSERT_TRUE(propagation.valid[n]) << "propagation node " << n;
+    EXPECT_LE(teaser::test::getAngularError(spectral.poses[n].R, propagation.poses[n].R), 1e-6)
+        << "node " << n;
+    EXPECT_LE((spectral.poses[n].t - propagation.poses[n].t).norm(), 1e-6) << "node " << n;
+  }
+}
+
+// Propagation is the reason the `order` parameter exists: it fixes the anchor AND the sweep
+// sequence. Node 1's only neighbour comes later in the order, so it is only reachable via the BFS
+// fallback -- a code path the spectral solver does not have at all.
+TEST(MultiviewTest, PropagationRespectsOrderAndBfsFallback) {
+  std::vector<teaser::Pose> gt(3);
+  gt[0].R = makeRotation(1, 0, 0, 0.0);        gt[0].t = Eigen::Vector3d(0, 0, 0);
+  gt[1].R = makeRotation(0.2, -0.5, 1.0, 0.6); gt[1].t = Eigen::Vector3d(1, -2, 0.5);
+  gt[2].R = makeRotation(0.7, 0.1, -0.3, 1.2); gt[2].t = Eigen::Vector3d(-1, 0.4, -1.5);
+
+  // Star centred on node 2; node 1 attaches only through it.
+  std::vector<std::pair<int, int>> graph = {{0, 2}, {1, 2}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/5);
+
+  std::vector<int> order = {0, 1, 2};
+  auto res = teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr,
+                                             makePropagationParams(1e-3), order);
+
+  ASSERT_EQ(res.num_components, 1);
+  const int anchor = 0; // earliest in the order
+  EXPECT_TRUE(res.poses[anchor].R.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
+  for (int n = 0; n < 3; ++n) {
+    EXPECT_TRUE(res.valid[n]) << "node " << n; // node 1 recovered via the fallback
+    Eigen::Matrix3d R_rel = gt[anchor].R.transpose() * gt[n].R;
+    Eigen::Vector3d t_rel = gt[anchor].R.transpose() * (gt[n].t - gt[anchor].t);
+    EXPECT_LE(teaser::test::getAngularError(R_rel, res.poses[n].R), 1e-2);
+    EXPECT_LE((res.poses[n].t - t_rel).norm(), 1e-2);
+  }
+}
+
+// The method is opt-in via Params, so the default must remain spectral. Verified behaviourally:
+// only the spectral path reports non-tree edges.
+TEST(MultiviewTest, DefaultMethodIsSpectral) {
+  EXPECT_EQ(teaser::RobustRegistrationSolver::Params().multiview_method,
+            teaser::RobustRegistrationSolver::MULTIVIEW_METHOD::SPECTRAL_SYNC);
+
+  auto gt = fourPoseGt();
+  std::vector<std::pair<int, int>> edges = {{0, 1}, {1, 2}, {2, 3}, {0, 2}};
+  auto scene = buildScene(gt, edges, /*k_in=*/30, /*k_out=*/0);
+  auto res = teaser::alignMultiScan(scene.clouds, scene.adjacency, scene.edge_weights, scene.corr,
+                                    makeParams(1e-3));
+  EXPECT_EQ(res.edge_residual.size(), 4u) << "default should align over the full graph";
 }
 
 // Degenerate input (too few correspondences) is reported as invalid.

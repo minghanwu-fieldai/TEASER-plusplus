@@ -145,9 +145,13 @@ struct MultiScanResult {
   /**
    * Per-edge fit quality, keyed by (min(i,j), max(i,j)): the mean world-frame residual over that
    * edge's inlier correspondences (those whose post-alignment residual is within the noise bound).
-   * Every edge that survived preprocessing gets an entry -- joint synchronization uses them all, so
-   * there is no tree-edge / loop-closure distinction. The value is -1 for an edge that retained no
-   * inliers, which is what a rejected edge looks like. Edges with no correspondences, too few to
+   * The value is -1 for an edge that retained no inliers, which is what a rejected edge looks like.
+   *
+   * Which edges appear depends on params.multiview_method. Under SPECTRAL_SYNC every edge that
+   * survived preprocessing gets an entry -- the joint solve uses them all, so there is no tree-edge
+   * / loop-closure distinction. Under DAG_PROPAGATION only edges actually used to pose a node
+   * appear: one per incoming edge of each aligned node, so an anchor's outgoing side and anything
+   * pruned by the spanning tree are absent. Either way, edges with no correspondences, too few to
    * survive the max-clique prune, or whose endpoints could not be aligned have no entry.
    */
   std::map<std::pair<int, int>, double> edge_residual;
@@ -158,16 +162,24 @@ struct MultiScanResult {
 /**
  * Align a set of overlapping scans into a common frame per connected component.
  *
- * Pipeline: split the adjacency graph into connected components (a warning is emitted if there is
- * more than one); within each component pick the node with the largest total edge weight as the
- * anchor (identity pose); then solve ALL poses at once by rotation synchronization followed by
- * translation synchronization, both driven by a graph-level GNC-TLS loop over the
- * max-clique-pruned correspondences.
+ * Shared pipeline: split the adjacency graph into connected components (a warning is emitted if
+ * there is more than one), and within each component pick the node with the largest total edge
+ * weight as the anchor (identity pose). `params.multiview_method` then selects the optimization:
  *
- * Every adjacency edge participates -- there is no spanning-tree prune, because a tree is exactly
- * determined and synchronizing over one would merely reproduce sequential propagation. Keeping
- * every edge is what lets a loop closure spread its error around the cycle instead of dumping it on
- * one edge, and lets the rest of the graph out-vote an edge that is coherently wrong.
+ * MULTIVIEW_METHOD::SPECTRAL_SYNC (default) solves ALL poses at once -- rotation synchronization
+ * then translation synchronization, both driven by a graph-level GNC-TLS loop over the
+ * max-clique-pruned correspondences. Every adjacency edge participates: no spanning-tree prune,
+ * because a tree is exactly determined and synchronizing over one would merely reproduce
+ * propagation. Keeping every edge is what lets a loop closure spread its error around the cycle
+ * instead of dumping it on one edge, and lets the graph out-vote an edge that is coherently wrong.
+ *
+ * MULTIVIEW_METHOD::DAG_PROPAGATION prunes to the maximum spanning tree and then sweeps outward
+ * from the anchor, solving one pose at a time against its already-posed neighbors via
+ * MultiviewSolver::solveNodePose. Each pose is frozen on arrival, so error accumulates along paths;
+ * cheaper, and each node's estimate traces to a single local solve.
+ *
+ * The method therefore changes both the edge set consumed (full graph vs. spanning tree) and the
+ * number of entries in MultiScanResult::edge_residual.
  *
  * `edge_weights` is documented as a spanning-tree weight independent of the correspondences, so it
  * is used ONLY to score anchors -- it is deliberately not reused as a per-edge cost weight. Use
@@ -194,18 +206,25 @@ MultiScanResult alignMultiScan(
 /**
  * Align a set of overlapping scans given a caller-provided graph (MST step skipped).
  *
- * Identical to alignMultiScan except that the graph is supplied directly. `graph_edges` are
- * undirected `(i, j)` pairs (duplicates ignored); the graph may or may not be a tree. Connected
- * components are derived from the edges, and each component's anchor is the highest-degree node
- * (ties -> smallest index). Every edge participates in the joint solve, so loop closures are
- * averaged in rather than pruned. The returned gauge (per-component identity anchor) matches
- * alignMultiScan.
+ * Identical to alignMultiScan except that the graph is supplied directly, so no spanning-tree prune
+ * happens under either method -- every supplied edge is used as given. `graph_edges` are undirected
+ * `(i, j)` pairs (duplicates ignored); the graph may or may not be a tree. Connected components are
+ * derived from the edges, and each component's anchor is the highest-degree node (ties -> smallest
+ * index). `params.multiview_method` selects the optimization, as for alignMultiScan. The returned
+ * gauge (per-component identity anchor) matches alignMultiScan.
  *
- * Optionally the caller can pass `order`, a preference order over the scans (root-most first).
- * Because all poses are now solved simultaneously there is no propagation sequence left for it to
- * control, so it does exactly one thing: it selects each component's anchor, namely the earliest
- * listed node in that component. Nodes absent from a non-empty `order` rank after all listed ones.
- * Since the anchor only fixes the gauge, an order inconsistent with the graph is harmless.
+ * Optionally the caller can pass `order`, a preference order over the scans (root-most first). What
+ * it controls depends on the method:
+ *
+ * - DAG_PROPAGATION: it fixes each component's anchor (the earliest listed node) AND the sweep
+ *   sequence, since poses propagate in that order. A node whose neighbors are all listed later is
+ *   still aligned once one of them is posed (BFS fallback), so an inconsistent order never leaves
+ *   nodes unaligned.
+ * - SPECTRAL_SYNC: all poses are solved simultaneously, so there is no sequence left to control and
+ *   it does exactly one thing -- select the anchor. Since the anchor only fixes the gauge, an order
+ *   inconsistent with the graph is harmless.
+ *
+ * Nodes absent from a non-empty `order` rank after all listed ones under both methods.
  *
  * @param clouds [in] clouds[i] is scan i (points in scan i's local frame)
  * @param graph_edges [in] undirected graph edges over vertices 0..clouds.size()-1 (tree or not)

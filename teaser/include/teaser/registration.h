@@ -488,6 +488,30 @@ public:
   };
 
   /**
+   * \brief Which algorithm the multi-scan drivers use to turn a scan graph into global poses.
+   *
+   * Read only by teaser::alignMultiScan and teaser::alignMultiScanWithGraph; the pairwise solver
+   * ignores it entirely. The two are genuinely different optimizations, not variants of one:
+   *
+   * SPECTRAL_SYNC: solve every pose at once. Rotations come from the top-3 eigenspace of a
+   * relative-rotation matrix over the whole graph, translations from a weighted graph Laplacian,
+   * both driven by a graph-level GNC-TLS loop. A loop closure spreads its error around the cycle,
+   * and an edge that disagrees with the rest of the graph can be out-voted by it.
+   *
+   * DAG_PROPAGATION: solve one pose at a time. Anchor a node, then sweep outward aligning each node
+   * to its already-posed neighbors via teaser::MultiviewSolver::solveNodePose. Each pose is fixed
+   * on arrival, so error accumulates along paths and a loop closure can only nudge the last node in
+   * the loop. Cheaper, and every node's estimate is explainable from a single local solve.
+   *
+   * The choice also changes what the drivers consume and report -- see the notes on
+   * alignMultiScan, alignMultiScanWithGraph and MultiScanResult::edge_residual in multiview.h.
+   */
+  enum class MULTIVIEW_METHOD {
+    SPECTRAL_SYNC = 0,
+    DAG_PROPAGATION = 1,
+  };
+
+  /**
    * A struct representing params for initializing the RobustRegistrationSolver
    *
    * Note: the default values needed to be changed accordingly for best performance.
@@ -542,6 +566,9 @@ public:
 
     /**
      * Type of TIM graph given to GNC rotation solver
+     *
+     * \attention Read only by the pairwise solver. The multi-scan drivers under
+     * MULTIVIEW_METHOD::SPECTRAL_SYNC always build a COMPLETE TIM graph and ignore this.
      */
     INLIER_GRAPH_FORMULATION rotation_tim_graph = INLIER_GRAPH_FORMULATION::CHAIN;
 
@@ -619,6 +646,16 @@ public:
      * GNCRotationSolver::Params::up_dst.
      */
     Eigen::Vector3d rotation_up_dst = Eigen::Vector3d::UnitZ();
+
+    /**
+     * \brief Which multi-scan algorithm teaser::alignMultiScan and teaser::alignMultiScanWithGraph
+     * run. Ignored by the pairwise solver. See MULTIVIEW_METHOD for the trade-off.
+     *
+     * \attention Declared last on purpose. The deprecated positional reset() overload aggregate-
+     * initializes Params field by field up to max_clique_num_threads, so a new field inserted before
+     * that point breaks it; appending leaves it default-initialized instead.
+     */
+    MULTIVIEW_METHOD multiview_method = MULTIVIEW_METHOD::SPECTRAL_SYNC;
   };
 
   RobustRegistrationSolver() = default;

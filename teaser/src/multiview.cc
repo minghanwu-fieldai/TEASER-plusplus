@@ -210,6 +210,153 @@ struct PreparedEdge {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
+// ============================ MULTIVIEW_METHOD::DAG_PROPAGATION ============================
+
+// Build a NeighborEdge aligning `child` (target/dst) to an already-posed `parent` (fixed source)
+// over their shared correspondences. Returns false if no usable correspondence columns remain.
+bool buildNeighborEdge(const std::vector<teaser::PointCloud>& clouds,
+                       const std::vector<std::pair<int, int>>& corr, int parent, int child,
+                       const teaser::Pose& parent_pose, teaser::NeighborEdge* edge) {
+  const bool parent_is_min = (parent < child);
+  edge->R_i = parent_pose.R;
+  edge->t_i = parent_pose.t;
+  edge->src.resize(3, static_cast<Eigen::Index>(corr.size()));
+  edge->dst.resize(3, static_cast<Eigen::Index>(corr.size()));
+  Eigen::Index col = 0;
+  for (const auto& c : corr) {
+    const int p_idx = parent_is_min ? c.first : c.second; // index into parent cloud
+    const int b_idx = parent_is_min ? c.second : c.first; // index into child cloud
+    if (p_idx < 0 || p_idx >= static_cast<int>(clouds[parent].size()) || b_idx < 0 ||
+        b_idx >= static_cast<int>(clouds[child].size())) {
+      continue; // skip malformed correspondence
+    }
+    const auto& pp = clouds[parent][p_idx];
+    const auto& bp = clouds[child][b_idx];
+    edge->src.col(col) << pp.x, pp.y, pp.z;
+    edge->dst.col(col) << bp.x, bp.y, bp.z;
+    ++col;
+  }
+  edge->src.conservativeResize(3, col);
+  edge->dst.conservativeResize(3, col);
+  return col > 0;
+}
+
+// Sequential propagation. Sweep nodes in reference order to a fixpoint, aligning each not-yet-
+// settled node that has at least one already-posed neighbor to ALL such neighbors via
+// MultiviewSolver::solveNodePose. A node whose neighbors are all posed later is picked up in a
+// subsequent sweep (BFS fallback from the anchor), so an order inconsistent with the graph never
+// leaves nodes unaligned. Anchors must already carry the identity pose and be marked in `is_anchor`.
+void alignByPropagation(
+    const std::vector<teaser::PointCloud>& clouds, const std::vector<std::vector<int>>& adj,
+    const std::vector<int>& ref,
+    const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
+    const teaser::RobustRegistrationSolver::Params& params,
+    const std::map<std::pair<int, int>, double>& edge_weight, const std::vector<char>& is_anchor,
+    teaser::MultiScanResult* result) {
+  const int N = static_cast<int>(clouds.size());
+  auto edge_key = [](int a, int b) { return std::make_pair(std::min(a, b), std::max(a, b)); };
+
+  // Sweep order: nodes sorted by ref (the caller order, or the BFS discovery order).
+  std::vector<int> proc(N);
+  std::iota(proc.begin(), proc.end(), 0);
+  std::stable_sort(proc.begin(), proc.end(), [&ref](int a, int b) { return ref[a] < ref[b]; });
+
+  std::vector<char> settled(N, 0);
+  for (int i = 0; i < N; ++i) {
+    if (is_anchor[i]) {
+      settled[i] = 1;
+    }
+  }
+
+  teaser::MultiviewSolver solver(params);
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const int node : proc) {
+      if (settled[node] || is_anchor[node]) {
+        continue;
+      }
+      std::vector<teaser::NeighborEdge> node_edges;
+      std::vector<int> used_parents;
+      for (const int p : adj[node]) {
+        if (!result->valid[p]) {
+          continue; // neighbor not posed yet (or failed)
+        }
+        const auto it = correspondences.find(edge_key(p, node));
+        if (it == correspondences.end() || it->second.empty()) {
+          continue;
+        }
+        teaser::NeighborEdge edge;
+        if (buildNeighborEdge(clouds, it->second, p, node, result->poses[p], &edge)) {
+          const auto wit = edge_weight.find(edge_key(p, node));
+          edge.weight = (wit != edge_weight.end()) ? wit->second : 1.0;
+          node_edges.push_back(std::move(edge));
+          used_parents.push_back(p);
+        }
+      }
+      if (node_edges.empty()) {
+        continue; // no posed neighbor yet -> defer to a later sweep
+      }
+
+      settled[node] = 1; // settled whether or not the solve succeeds
+      changed = true;
+
+      const teaser::RegistrationSolution sol = solver.solveNodePose(node_edges);
+      result->poses[node].R = sol.rotation;
+      result->poses[node].t = sol.translation;
+      result->valid[node] = sol.valid;
+      if (!sol.valid) {
+        std::cerr << "[teaser::multiview] Warning: alignment failed for node " << node << ".\n";
+        continue;
+      }
+
+      // Per-edge fit quality: mean world-frame residual over each edge's inlier correspondences
+      // (those consistent with the recovered pose within the noise bound).
+      const double inlier_thresh =
+          2.0 * params.noise_bound * std::sqrt(std::max(0.0, params.cbar2));
+      const teaser::Pose& child_pose = result->poses[node];
+      for (const int p : used_parents) {
+        const auto& corr = correspondences.at(edge_key(p, node));
+        const bool parent_is_min = (p < node);
+        const teaser::Pose& parent_pose = result->poses[p];
+        double residual_sum = 0.0;
+        int inlier_count = 0;
+        for (const auto& c : corr) {
+          const int p_idx = parent_is_min ? c.first : c.second;
+          const int b_idx = parent_is_min ? c.second : c.first;
+          if (p_idx < 0 || p_idx >= static_cast<int>(clouds[p].size()) || b_idx < 0 ||
+              b_idx >= static_cast<int>(clouds[node].size())) {
+            continue;
+          }
+          const auto& pp = clouds[p][p_idx];
+          const auto& bp = clouds[node][b_idx];
+          const Eigen::Vector3d wp =
+              parent_pose.R * Eigen::Vector3d(pp.x, pp.y, pp.z) + parent_pose.t;
+          const Eigen::Vector3d wb =
+              child_pose.R * Eigen::Vector3d(bp.x, bp.y, bp.z) + child_pose.t;
+          const double r = (wp - wb).norm();
+          if (r <= inlier_thresh) {
+            residual_sum += r;
+            ++inlier_count;
+          }
+        }
+        result->edge_residual[edge_key(p, node)] =
+            (inlier_count > 0) ? residual_sum / inlier_count : -1.0;
+      }
+    }
+  }
+
+  // Any non-anchor node never reached (no usable path to a posed node) stays invalid.
+  for (int i = 0; i < N; ++i) {
+    if (!settled[i] && !is_anchor[i]) {
+      std::cerr << "[teaser::multiview] Warning: node " << i
+                << " could not be aligned (no usable path to an anchor).\n";
+    }
+  }
+}
+
+// ============================ MULTIVIEW_METHOD::SPECTRAL_SYNC ============================
+
 // Pull edge (p,q)'s correspondences out of the clouds as two 3-by-m point matrices. The
 // correspondence map is keyed by (min,max), so which member of each pair indexes which cloud
 // depends on the node ordering.
@@ -501,6 +648,14 @@ teaser::MultiScanResult alignAlongGraph(
     }
   }
 
+  // Everything above -- components, anchors, reference order -- is shared. The two methods diverge
+  // only in how they turn the graph into poses.
+  if (params.multiview_method ==
+      teaser::RobustRegistrationSolver::MULTIVIEW_METHOD::DAG_PROPAGATION) {
+    alignByPropagation(clouds, adj, ref, correspondences, params, edge_weight, is_anchor, &result);
+    return result;
+  }
+
   // ---------- Per-edge preprocessing ----------
   // Both stages consume the same max-clique-pruned correspondences, so prune once up front.
   //
@@ -722,21 +877,37 @@ teaser::MultiScanResult teaser::alignMultiScan(
       weighted_edges.push_back({i, j, w});
     }
   }
-  // --- 2. Synchronize over the FULL adjacency graph. ---
-  // No spanning-tree prune: a tree is exactly determined, so synchronizing over one would just
-  // reproduce what sequential propagation already did. Keeping every edge is what lets loop
-  // closures be averaged in. `edge_weights` still only scores anchors -- it is documented as an MST
-  // weight independent of the correspondences, so it is deliberately NOT reused as a cost weight.
-  std::vector<std::pair<int, int>> all_edges;
-  all_edges.reserve(weighted_edges.size());
+  // --- 2. Choose the edge set to align over. ---
+  // Anchors are always scored by total incident edge weight over the whole adjacency graph.
+  // `edge_weights` is documented as a spanning-tree weight independent of the correspondences, so it
+  // is deliberately NOT reused as a per-edge cost weight in either method.
   std::vector<double> anchor_score(N, 0.0);
   for (const auto& e : weighted_edges) {
-    all_edges.push_back({e.u, e.v});
     anchor_score[e.u] += e.weight;
     anchor_score[e.v] += e.weight;
   }
 
-  return alignAlongGraph(clouds, all_edges, anchor_score, correspondences, params, /*order=*/{},
+  std::vector<std::pair<int, int>> selected_edges;
+  if (params.multiview_method ==
+      teaser::RobustRegistrationSolver::MULTIVIEW_METHOD::DAG_PROPAGATION) {
+    // Propagation walks a tree: prune to the maximum spanning tree, as documented.
+    const std::vector<teaser::WeightedEdge> forest =
+        teaser::kruskalSpanningTree(N, weighted_edges, /*maximum=*/true);
+    selected_edges.reserve(forest.size());
+    for (const auto& e : forest) {
+      selected_edges.push_back({e.u, e.v});
+    }
+  } else {
+    // Synchronization wants every edge. A tree is exactly determined, so pruning to one would just
+    // reproduce what propagation already does; keeping the extra edges is what lets loop closures
+    // be averaged in.
+    selected_edges.reserve(weighted_edges.size());
+    for (const auto& e : weighted_edges) {
+      selected_edges.push_back({e.u, e.v});
+    }
+  }
+
+  return alignAlongGraph(clouds, selected_edges, anchor_score, correspondences, params, /*order=*/{},
                          /*edge_weight=*/{});
 }
 
