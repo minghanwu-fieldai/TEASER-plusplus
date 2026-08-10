@@ -178,14 +178,33 @@ You should be able to see Open3D windows showing registration results:
 ## Multi-scan alignment
 
 In addition to the pairwise solver, this fork provides an experimental driver for aligning **many**
-overlapping scans into a common frame. It is declared in `teaser/multiview.h` and lives entirely on
-top of the existing pairwise pipeline (the core solver is unchanged).
+overlapping scans into a common frame. It is declared in `teaser/multiview.h`; the core pairwise
+solver is unchanged.
+
+### Two solvers, one interface
+
+`params.multiview_method` selects the optimization. They are genuinely different algorithms, not
+variants of one, and both are supported:
+
+| | `SPECTRAL_SYNC` (default) | `DAG_PROPAGATION` |
+|---|---|---|
+| Solves | every pose **jointly** | one pose at a time |
+| Rotation | top-3 eigenspace of a graph-wide relative-rotation matrix | per-node GNC-TLS via `MultiviewSolver::solveNodePose` |
+| Translation | weighted graph Laplacian, one sparse factorization | per-node component-wise TLS |
+| Loop closures | error spread around the cycle | absorbed only by the last node in the loop |
+| A wrong edge | can be out-voted by the rest of the graph | corrupts whatever it poses |
+| Cost | one eigendecomposition + one Laplacian solve per GNC iteration | one pairwise solve per scan |
+
+Use the default unless you need propagation's per-node traceability or lower cost. See
+`multiview-math.md` for the derivations and `spectral.md` for the algorithm as pseudocode.
+
+### `alignMultiScan`
 
 ```cpp
 teaser::MultiScanResult teaser::alignMultiScan(
     const std::vector<teaser::PointCloud>& clouds,       // clouds[i] = scan i, in scan i's local frame
     const teaser::Graph& adjacency,                      // which scans overlap (vertices 0..N-1)
-    const std::map<std::pair<int,int>, double>& edge_weights,           // MST weight per edge, keyed by (min(i,j),max(i,j))
+    const std::map<std::pair<int,int>, double>& edge_weights,           // per-edge weight, keyed by (min(i,j),max(i,j))
     const std::map<std::pair<int,int>,                   // per-edge putative correspondences, keyed by
                    std::vector<std::pair<int,int>>>& correspondences,  //   (min(i,j),max(i,j))
     const teaser::RobustRegistrationSolver::Params& params);
@@ -193,39 +212,49 @@ teaser::MultiScanResult teaser::alignMultiScan(
 
 **Contract**
 
-- *Inputs.* One `PointCloud` per scan (points expressed in that scan's own local frame); an
-  adjacency graph marking which scans overlap; a **caller-supplied MST edge weight** per edge
-  (keyed by `(min(i,j), max(i,j))`; missing edges count as weight 0); and, for each adjacency edge
-  `(i,j)`, the **raw putative** correspondences keyed the same way, where each pair `(a,b)` is
-  `(index into cloud[min], index into cloud[max])`. Correspondences may contain outliers — the
-  per-edge robust solve performs its own inlier selection (scale-consistency + max-clique +
-  GNC-TLS). No feature matching is done for you.
+- *Inputs.* One `PointCloud` per scan (points in that scan's own local frame); an adjacency graph
+  marking which scans overlap; a caller-supplied weight per edge (keyed by `(min(i,j), max(i,j))`;
+  missing edges count as 0); and, for each adjacency edge, the **raw putative** correspondences keyed
+  the same way, each pair `(a,b)` being `(index into cloud[min], index into cloud[max])`.
+  Correspondences may contain outliers — inlier selection (scale-consistency + max-clique + GNC-TLS)
+  is done for you. Feature matching is not.
 - *Assumptions.* Scale is fixed to `1` (rigid alignment). Adjacency vertices are `0..N-1`.
-- *What it does.* Builds a **maximum spanning tree** using the caller-supplied edge weights (which
-  are independent of the correspondences — use any proxy such as overlap, proximity, or keypoint
-  count), splits the graph into connected components (a warning is emitted if there is more than
-  one), picks the **highest-total-weight node of each component as the anchor** (identity pose),
-  and propagates poses outward **along tree edges only**, in topological order, aligning each child
-  to its single already-posed parent. Because only tree edges are used, correspondences are
-  consulted for tree edges only.
-- *Output.* `MultiScanResult { poses, valid, component, edge_residual, num_components }` — one
-  global pose (`local → world`: `world = R·local + t`) per scan. Poses are **gauge-fixed per
-  component**: each component's anchor is the identity, so poses are only meaningful *relative to
-  their component's anchor*, and separate components live in unrelated frames. `valid[i]` is
-  `false` for any scan whose alignment failed or that was unreachable (e.g. its parent failed).
-  `edge_residual` is a per-edge fit-quality map keyed by `(min(i,j), max(i,j))`: for each edge
-  actually used during alignment, the **mean world-frame residual** over that edge's inlier
-  correspondences (those consistent with the recovered pose within the noise bound). A multi-parent
-  node contributes one entry per incoming edge; the value is `-1` for a used edge with no inliers,
-  and edges that were not used (pruned by the MST path, or touching an unaligned node) have no entry.
-- *Limitations.* This MST path uses tree-only propagation (non-tree / loop-closure edges are not
-  fused — see `alignMultiScanWithGraph` below to keep them), no scale estimation, and both the edge
-  weights and correspondences must be supplied by the caller.
+- *Edge set — differs by method.* Under `SPECTRAL_SYNC` **every adjacency edge participates**: a
+  spanning tree is exactly determined, so pruning to one would merely reproduce propagation, and
+  keeping the extra edges is what lets loop closures be averaged in. Under `DAG_PROPAGATION` the
+  edge weights build a **maximum spanning tree** and poses propagate along it. In both cases the
+  weights are used to score anchors; they are documented as tree weights independent of the
+  correspondences (use any proxy — overlap, proximity, keypoint count), so they are *not* reused as a
+  per-edge cost weight here. Use `alignMultiScanWithGraph` for that.
+  ⚠️ Under the default, supply correspondences for **all** adjacency edges. Supplying them for tree
+  edges only still works, but silently forfeits the loop closures.
+- *Anchoring.* The graph is split into connected components (a warning is emitted if there is more
+  than one) and the highest-total-weight node of each becomes its anchor.
+- *Output.* `MultiScanResult { poses, valid, component, edge_residual, num_components }` — one global
+  pose (`local → world`: `world = R·local + t`) per scan, **gauge-fixed per component**: each
+  component's anchor is the identity, so poses are meaningful only *relative to their component's
+  anchor*, and separate components live in unrelated frames. `valid[i]` is `false` for a scan whose
+  alignment failed or that no usable edge reached.
+- *`edge_residual` — differs by method.* A fit-quality map keyed by `(min(i,j), max(i,j))`: the mean
+  world-frame residual over that edge's inlier correspondences, or `-1` if it retained none (what a
+  rejected edge looks like). Under `SPECTRAL_SYNC` every edge that survived preprocessing gets an
+  entry — there is no tree/loop-closure distinction. Under `DAG_PROPAGATION` only edges actually used
+  to pose a node appear, so an anchor's outgoing side and anything the spanning tree pruned are
+  absent. On the same 4-edge graph that is 4 entries versus 3.
+- *Limitations.* No scale estimation; edge weights and correspondences must both be supplied by the
+  caller.
 
-**Bring your own graph.** If you would rather supply the topology yourself, call
-`alignMultiScanWithGraph` instead — it skips the MST step and works over the `graph_edges` you
-provide (undirected `(i,j)` pairs, duplicates ignored). Its full signature (the last two arguments
-are optional and covered below):
+⚠️ **`noise_bound` is interpreted differently under `SPECTRAL_SYNC`.** Every scan's pose is unknown
+there, so both sides of a residual are noisy and the bounds compose symmetrically: `2δ_p + 2δ_q` for
+the TIM-based rotation stage and `δ_p + δ_q` for translation. The pairwise pipeline (and therefore
+`DAG_PROPAGATION`) treats the source cloud as exact and uses `2δ`. The same `noise_bound` value is
+consequently a **2× looser** gate on rotation under the default — re-check any empirically tuned
+value when switching.
+
+### `alignMultiScanWithGraph` — bring your own graph
+
+Skips the spanning-tree step and works over the `graph_edges` you provide (undirected `(i,j)` pairs,
+duplicates ignored), under either method:
 
 ```cpp
 teaser::MultiScanResult teaser::alignMultiScanWithGraph(
@@ -234,40 +263,43 @@ teaser::MultiScanResult teaser::alignMultiScanWithGraph(
     const std::map<std::pair<int,int>,                   // per-edge putative correspondences, keyed by
                    std::vector<std::pair<int,int>>>& correspondences,  //   (min(i,j),max(i,j))
     const teaser::RobustRegistrationSolver::Params& params,
-    const std::vector<int>& order = {},                  // optional topological order (root-most first)
+    const std::vector<int>& order = {},                  // optional preference order (root-most first)
     const std::vector<double>& edge_weights = {});       // optional per-edge weights (aligned with graph_edges)
 ```
 
-Unlike the MST path, **it respects the whole graph, tree or not**: connected components
-are derived from the edges (a warning is still emitted if there is more than one), the
-highest-degree node of each component (ties → smallest index) is the anchor/root, and a BFS from
-that root assigns a discovery order used to orient every edge from the earlier-discovered endpoint
-(parent) to the later one (child). Because that orientation follows a total order it is always
-acyclic, so **loop-closure edges are kept, not pruned**: a node with several in-edges is aligned to
-all of its already-posed parents at once (the multi-edge aggregation from `multiview.md`), and each
-of those edges gets its own entry in `edge_residual`. Any node with no edges
-becomes its own single-node component with the identity pose. The per-component identity gauge and
-child-as-target convention are the same as the MST path.
+Connected components are derived from the edges (a warning is still emitted if there is more than
+one) and the highest-degree node of each (ties → smallest index) is the anchor. Any node with no
+edges becomes its own single-node component with the identity pose. The per-component identity gauge
+matches `alignMultiScan`.
 
-**Control the order.** `alignMultiScanWithGraph` takes an optional last argument `order` — a
-topological list of node indices, root-most first (e.g. a sequential capture order). When given, it
-replaces the automatic highest-degree/BFS reference: it picks each component's anchor (the earliest
-listed node), orients every edge (earlier in the order = parent), and sets the order in which scans
-are aligned. Nodes absent from a non-empty `order` are ranked after all listed ones, and a node
-whose neighbors are all later in the order is still aligned once one of them is posed (BFS
-fallback), so an order that doesn't perfectly match the graph never leaves scans unaligned.
+**Control the order.** `order` is a list of node indices, root-most first (e.g. a sequential capture
+order). What it controls depends on the method:
 
-**Weight the edges.** `alignMultiScanWithGraph` also takes an optional `edge_weights` — one weight
-per entry of `graph_edges`. Edge `i`'s weight scales every one of its correspondences in the
-aggregated rotation **and** translation TLS cost (empty = all weight 1). This is threaded exactly
-through the solver: a per-correspondence weight is carried into the weighted rotation SVD and the
-translation weighted mean; for the TIM-based rotation, each pruned TIM's weight is the geometric
-mean of its two endpoint correspondence weights (so a within-edge TIM keeps that edge's weight).
-⚠️ The weight scales the cost **among the max-clique inliers** — it does not influence max-clique
-inlier selection or the scale-consistency prune, so it refines the fit among already-consistent
-correspondences rather than arbitrating between conflicting edges.
+- `DAG_PROPAGATION` — it fixes each component's anchor (the earliest listed node) **and** the sweep
+  sequence, since poses propagate in that order. A node whose neighbors are all listed later is still
+  aligned once one of them is posed (BFS fallback), so an imperfect order never leaves scans
+  unaligned.
+- `SPECTRAL_SYNC` — all poses are solved simultaneously, so there is no sequence left to control and
+  it does exactly one thing: select the anchor. Since the anchor only fixes the gauge, an order
+  inconsistent with the graph is harmless.
 
-See `test/teaser/multiview-test.cc` for end-to-end usage.
+Nodes absent from a non-empty `order` rank after all listed ones under both methods.
+
+**Weight the edges.** `edge_weights` is one weight per entry of `graph_edges` (empty = all 1). A
+weight of 0 drops the edge entirely under both methods. Otherwise:
+
+- `SPECTRAL_SYNC` — the weight scales the edge's whole contribution: its block in the rotation
+  synchronization matrix and its term in the translation Laplacian. This *does* arbitrate between
+  conflicting edges, because the graph-level GNC loop additionally folds each edge's surviving
+  correspondence weight into that same channel.
+- `DAG_PROPAGATION` — the weight scales every one of that edge's correspondences in the aggregated
+  per-node rotation and translation TLS cost (carried into the weighted rotation SVD and the
+  translation weighted mean; a pruned TIM takes the geometric mean of its two endpoints' weights).
+  ⚠️ It scales the cost **among the max-clique inliers** only — it does not influence max-clique
+  selection or the scale-consistency prune, so it refines the fit among already-consistent
+  correspondences rather than arbitrating between conflicting edges.
+
+See `test/teaser/multiview-test.cc` for end-to-end usage of both methods.
 
 ## Other Publications
 Other publications related to TEASER include:
