@@ -1,6 +1,7 @@
 /bazel-*
 BROWSE
 /build*
+/install/
 *.bzlc
 .cache
 .classpath
