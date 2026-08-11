@@ -22,6 +22,7 @@
 
 #include "teaser/registration.h"
 
+#include "pose_refine.h"
 #include "rotation_sync.h"
 #include "translation_sync.h"
 
@@ -777,6 +778,29 @@ teaser::MultiScanResult alignAlongGraph(
         break;
       }
     }
+  }
+
+  // ---------- Joint Gauss-Newton refinement ----------
+  // The spectral rotation and Laplacian translation solves are relaxations that each discard
+  // information (per-edge anisotropy; the rotation->translation coupling). A local GN refinement of
+  // the true raw-point objective, seeded by (R, t) above, recovers it -- see pose_refine.h. This
+  // runs in the sync gauge (each component's lowest-indexed node held fixed), so it composes with
+  // the re-gauge below unchanged. Config is fixed here rather than exposed on Params to avoid an
+  // ABI change; direct callers of refinePoses get the full knobs.
+  {
+    std::vector<teaser::PoseRefineEdge> refine_edges(prepared.size());
+    for (size_t e = 0; e < prepared.size(); ++e) {
+      refine_edges[e].p = prepared[e].p;
+      refine_edges[e].q = prepared[e].q;
+      refine_edges[e].p_pts = prepared[e].p_pts;
+      refine_edges[e].q_pts = prepared[e].q_pts;
+      refine_edges[e].w = w_trans[e]; // converged point-level GNC weights
+      refine_edges[e].edge_weight = prepared[e].confidence / sigma_trans_sq;
+    }
+    const teaser::PoseRefineResult refined =
+        teaser::refinePoses(N, refine_edges, R, t, teaser::PoseRefineParams());
+    R = refined.rotations;
+    t = refined.translations;
   }
 
   // ---------- Re-gauge to each component's anchor ----------

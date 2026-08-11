@@ -83,32 +83,42 @@ struct Scene {
 // Build a scene from ground-truth poses (local->world) and an edge list. Each edge gets `k_in`
 // shared inlier correspondences plus `k_out` gross-outlier correspondences (mismatched points).
 Scene buildScene(const std::vector<teaser::Pose>& gt,
-                 const std::vector<std::pair<int, int>>& edges, int k_in, int k_out) {
+                 const std::vector<std::pair<int, int>>& edges, int k_in, int k_out,
+                 double noise = 0.0) {
   const int N = static_cast<int>(gt.size());
   Scene s;
   s.gt = gt;
   std::vector<std::vector<Eigen::Vector3d>> local_pts(N);
   std::uniform_real_distribution<double> dist(-2.0, 2.0);
+  std::normal_distribution<double> gauss(0.0, noise);
 
-  auto add_world_point = [&](int node, const Eigen::Vector3d& w) {
-    local_pts[node].push_back(gt[node].R.transpose() * (w - gt[node].t));
+  // Add the point `w` (world frame) to `node`, expressed in its local frame, with optional
+  // per-observation Gaussian noise so each scan sees an independently-perturbed copy.
+  auto add_world_point = [&](int node, const Eigen::Vector3d& w, bool noisy) {
+    Eigen::Vector3d local = gt[node].R.transpose() * (w - gt[node].t);
+    if (noisy && noise > 0) {
+      local += Eigen::Vector3d(gauss(rng()), gauss(rng()), gauss(rng()));
+    }
+    local_pts[node].push_back(local);
     return static_cast<int>(local_pts[node].size()) - 1;
   };
 
   for (const auto& e : edges) {
     const int i = e.first, j = e.second;
     std::vector<std::pair<int, int>> pairs;
-    // Inliers: the same world point observed in both scans.
+    // Inliers: the same world point observed (independently perturbed) in both scans.
     for (int k = 0; k < k_in; ++k) {
       Eigen::Vector3d w(dist(rng()), dist(rng()), dist(rng()));
-      const int ii = add_world_point(i, w);
-      const int jj = add_world_point(j, w);
+      const int ii = add_world_point(i, w, /*noisy=*/true);
+      const int jj = add_world_point(j, w, /*noisy=*/true);
       pairs.push_back(i < j ? std::make_pair(ii, jj) : std::make_pair(jj, ii));
     }
     // Gross outliers: unrelated points in each scan.
     for (int k = 0; k < k_out; ++k) {
-      const int ii = add_world_point(i, Eigen::Vector3d(dist(rng()), dist(rng()), dist(rng())));
-      const int jj = add_world_point(j, Eigen::Vector3d(dist(rng()), dist(rng()), dist(rng())));
+      const int ii =
+          add_world_point(i, Eigen::Vector3d(dist(rng()), dist(rng()), dist(rng())), false);
+      const int jj =
+          add_world_point(j, Eigen::Vector3d(dist(rng()), dist(rng()), dist(rng())), false);
       pairs.push_back(i < j ? std::make_pair(ii, jj) : std::make_pair(jj, ii));
     }
     s.corr[{std::min(i, j), std::max(i, j)}] = pairs;
@@ -810,6 +820,50 @@ TEST(MultiviewTest, DefaultMethodIsSpectral) {
   auto res = teaser::alignMultiScan(scene.clouds, scene.adjacency, scene.edge_weights, scene.corr,
                                     makeParams(1e-3));
   EXPECT_EQ(res.edge_residual.size(), 4u) << "default should align over the full graph";
+}
+
+// End-to-end accuracy under measurement noise: the spectral path (spectral relaxation + joint GN
+// refinement) should recover poses at least as accurately as sequential propagation on a loopy
+// graph, where refinement distributes the residual instead of letting it accumulate. Averaged over
+// trials, since neither is guaranteed to win on any single noisy draw.
+TEST(MultiviewTest, RefinedSpectralAccuracyUnderNoise) {
+  constexpr int kTrials = 12;
+  constexpr double kNoise = 0.01;
+  double spectral_err = 0;
+  double propagation_err = 0;
+
+  for (int trial = 0; trial < kTrials; ++trial) {
+    auto gt = fourPoseGt();
+    // 4-cycle plus both diagonals: plenty of loop closures for the joint solve to exploit.
+    std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {0, 3}, {0, 2}, {1, 3}};
+    auto scene = buildScene(gt, graph, /*k_in=*/40, /*k_out=*/0, kNoise);
+
+    const auto spectral =
+        teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(0.05));
+    const auto propagation = teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr,
+                                                             makePropagationParams(0.05));
+    ASSERT_EQ(spectral.num_components, 1);
+    ASSERT_EQ(propagation.num_components, 1);
+
+    // Both gauge-fix at node 0 (highest degree here is a tie -> smallest index). Compare relative
+    // poses to GT re-expressed in node 0's frame.
+    const Eigen::Matrix3d Ra = gt[0].R;
+    const Eigen::Vector3d ta = gt[0].t;
+    for (int n = 1; n < 4; ++n) {
+      const Eigen::Matrix3d R_rel = Ra.transpose() * gt[n].R;
+      const Eigen::Vector3d t_rel = Ra.transpose() * (gt[n].t - ta);
+      spectral_err += teaser::test::getAngularError(R_rel, spectral.poses[n].R) +
+                      (spectral.poses[n].t - t_rel).norm();
+      propagation_err += teaser::test::getAngularError(R_rel, propagation.poses[n].R) +
+                         (propagation.poses[n].t - t_rel).norm();
+    }
+  }
+
+  // The refined joint solve should be at least as accurate as propagation on aggregate.
+  EXPECT_LE(spectral_err, propagation_err)
+      << "spectral=" << spectral_err << " propagation=" << propagation_err;
+  // And both should be in a sane regime for this noise level.
+  EXPECT_LT(spectral_err / (kTrials * 3), 0.05);
 }
 
 // Degenerate input (too few correspondences) is reported as invalid.

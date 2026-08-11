@@ -14,6 +14,7 @@ set(TEST_SRCS
         multiview-test.cc
         rotation-sync-test.cc
         translation-sync-test.cc
+        pose-refine-test.cc
         graph-test.cc
         certification-test.cc
         linalg-test.cc)

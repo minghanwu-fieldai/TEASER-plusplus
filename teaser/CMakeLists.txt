@@ -56,6 +56,7 @@ add_library(teaser_registration
         src/rotation_sync.cc
         src/sync_components.cc
         src/translation_sync.cc
+        src/pose_refine.cc
 )
 
 target_link_libraries(teaser_registration
