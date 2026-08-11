@@ -780,14 +780,14 @@ teaser::MultiScanResult alignAlongGraph(
     }
   }
 
-  // ---------- Joint Gauss-Newton refinement ----------
+  // ---------- Joint Levenberg-Marquardt refinement (optional) ----------
   // The spectral rotation and Laplacian translation solves are relaxations that each discard
-  // information (per-edge anisotropy; the rotation->translation coupling). A local GN refinement of
-  // the true raw-point objective, seeded by (R, t) above, recovers it -- see pose_refine.h. This
-  // runs in the sync gauge (each component's lowest-indexed node held fixed), so it composes with
-  // the re-gauge below unchanged. Config is fixed here rather than exposed on Params to avoid an
-  // ABI change; direct callers of refinePoses get the full knobs.
-  {
+  // information (per-edge anisotropy; the rotation->translation coupling). A local LM refinement of
+  // the true raw-point objective, seeded by (R, t) above, recovers it -- see pose_refine.h. The LM
+  // solve only commits cost-decreasing steps, so it never returns poses worse than the seed. It
+  // runs in the sync gauge (each component's lowest-indexed node held fixed), composing with the
+  // re-gauge below unchanged. Gated by params.multiview_refine_iterations (0 = off).
+  if (params.multiview_refine_iterations > 0) {
     std::vector<teaser::PoseRefineEdge> refine_edges(prepared.size());
     for (size_t e = 0; e < prepared.size(); ++e) {
       refine_edges[e].p = prepared[e].p;
@@ -797,10 +797,14 @@ teaser::MultiScanResult alignAlongGraph(
       refine_edges[e].w = w_trans[e]; // converged point-level GNC weights
       refine_edges[e].edge_weight = prepared[e].confidence / sigma_trans_sq;
     }
-    const teaser::PoseRefineResult refined =
-        teaser::refinePoses(N, refine_edges, R, t, teaser::PoseRefineParams());
+    teaser::PoseRefineParams rp;
+    rp.max_iterations = params.multiview_refine_iterations;
+    const teaser::PoseRefineResult refined = teaser::refinePoses(N, refine_edges, R, t, rp);
     R = refined.rotations;
     t = refined.translations;
+    std::cerr << "[teaser::multiview] refinement moved poses by "
+              << refined.avg_translation_change << " (translation, avg) / "
+              << refined.avg_rotation_change << " rad (rotation, avg).\n";
   }
 
   // ---------- Re-gauge to each component's anchor ----------

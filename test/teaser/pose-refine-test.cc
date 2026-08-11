@@ -341,6 +341,72 @@ TEST(PoseRefineTest, DegenerateInputs) {
   EXPECT_TRUE(none.rotations.empty());
 }
 
+// The LM guarantee: from a poor initialization -- large rotation error plus outlier-laden weights
+// where a raw Gauss-Newton step would overshoot and worsen the fit -- refinement must never return
+// a higher cost than it started with. This is the property that stops the refinement from
+// degrading a real run.
+TEST(PoseRefineTest, NeverWorseThanInitOnBadSeed) {
+  for (int trial = 0; trial < 20; ++trial) {
+    std::vector<Mat3> R_gt = {randomRotation(), randomRotation(), randomRotation(),
+                              randomRotation()};
+    std::vector<Vec3> t_gt = {randomTranslation(), randomTranslation(), randomTranslation(),
+                              randomTranslation()};
+    std::vector<teaser::PoseRefineEdge> edges = {
+        makeEdge(0, 1, R_gt, t_gt, 20, 0.05), makeEdge(1, 2, R_gt, t_gt, 20, 0.05),
+        makeEdge(2, 3, R_gt, t_gt, 20, 0.05), makeEdge(0, 3, R_gt, t_gt, 20, 0.05)};
+    // Corrupt a chunk of one edge's correspondences so the (non-robust) LS cost has an outlier
+    // pull, and give the init a large rotation error so a full GN step would overshoot.
+    std::uniform_real_distribution<double> junk(-3.0, 3.0);
+    for (int j = 0; j < 8; ++j) {
+      edges[1].q_pts.col(j) << junk(rng()), junk(rng()), junk(rng());
+    }
+    std::vector<Mat3> R0;
+    std::vector<Vec3> t0;
+    anchoredGt(R_gt, t_gt, &R0, &t0);
+    for (int i = 1; i < 4; ++i) {
+      R0[i] = perturbRotation(R0[i], 0.6); // deliberately far from the optimum
+      t0[i] += Vec3(0.5, -0.4, 0.3);
+    }
+    const double init_cost = totalCost(edges, R0, t0);
+
+    const auto res = teaser::refinePoses(4, edges, R0, t0);
+    const double ref_cost = totalCost(edges, res.rotations, res.translations);
+    EXPECT_LE(ref_cost, init_cost + 1e-9) << "trial " << trial << ": refinement worsened the cost";
+  }
+}
+
+// The translation/rotation change diagnostics track how far refinement moved the poses: nonzero
+// from a perturbed init, and exactly zero when refinement is disabled.
+TEST(PoseRefineTest, ReportsAverageChange) {
+  std::vector<Mat3> R_gt = {randomRotation(), randomRotation(), randomRotation()};
+  std::vector<Vec3> t_gt = {randomTranslation(), randomTranslation(), randomTranslation()};
+  std::vector<teaser::PoseRefineEdge> edges = {makeEdge(0, 1, R_gt, t_gt, 25),
+                                               makeEdge(1, 2, R_gt, t_gt, 25),
+                                               makeEdge(0, 2, R_gt, t_gt, 25)};
+  std::vector<Mat3> R0;
+  std::vector<Vec3> t0;
+  anchoredGt(R_gt, t_gt, &R0, &t0);
+  for (int i = 1; i < 3; ++i) {
+    R0[i] = perturbRotation(R0[i], 0.1);
+    t0[i] += Vec3(0.2, -0.15, 0.1);
+  }
+
+  const auto res = teaser::refinePoses(3, edges, R0, t0);
+  // It recovered GT, so it moved by about the perturbation magnitude -- positive and sane.
+  EXPECT_GT(res.avg_translation_change, 1e-3);
+  EXPECT_GT(res.avg_rotation_change, 1e-3);
+  EXPECT_LT(res.avg_translation_change, 1.0);
+
+  // Disabled: no movement. Translation is exactly zero (poses copied through untouched); the
+  // rotation change is computed via acos(trace(R^T R)) which carries an ~1e-8 floating-point floor
+  // even for identical matrices, so allow that.
+  teaser::PoseRefineParams off;
+  off.max_iterations = 0;
+  const auto none = teaser::refinePoses(3, edges, R0, t0, off);
+  EXPECT_DOUBLE_EQ(none.avg_translation_change, 0.0);
+  EXPECT_NEAR(none.avg_rotation_change, 0.0, 1e-6);
+}
+
 TEST(PoseRefineTest, Deterministic) {
   std::vector<Mat3> R_gt = {randomRotation(), randomRotation(), randomRotation(), randomRotation()};
   std::vector<Vec3> t_gt = {randomTranslation(), randomTranslation(), randomTranslation(),

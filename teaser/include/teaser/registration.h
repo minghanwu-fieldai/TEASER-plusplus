@@ -651,11 +651,26 @@ public:
      * \brief Which multi-scan algorithm teaser::alignMultiScan and teaser::alignMultiScanWithGraph
      * run. Ignored by the pairwise solver. See MULTIVIEW_METHOD for the trade-off.
      *
-     * \attention Declared last on purpose. The deprecated positional reset() overload aggregate-
-     * initializes Params field by field up to max_clique_num_threads, so a new field inserted before
-     * that point breaks it; appending leaves it default-initialized instead.
+     * \attention Declared near the end on purpose. The deprecated positional reset() overload
+     * aggregate-initializes Params field by field up to max_clique_num_threads, so a new field
+     * inserted before that point breaks it; appending leaves it default-initialized instead.
      */
     MULTIVIEW_METHOD multiview_method = MULTIVIEW_METHOD::SPECTRAL_SYNC;
+
+    /**
+     * \brief Maximum Levenberg-Marquardt iterations for the final joint pose refinement in the
+     * MULTIVIEW_METHOD::SPECTRAL_SYNC multi-scan path. 0 disables refinement entirely (the poses
+     * are then the raw spectral + Laplacian estimate). Ignored by the pairwise solver and by
+     * DAG_PROPAGATION.
+     *
+     * The refinement is a monotone LM solve: it only commits cost-decreasing steps, so it never
+     * returns poses worse than the spectral seed. Disable it if you want the pre-refinement
+     * behavior, or raise/lower the iteration budget. See teaser/src/pose_refine.h for the full
+     * knobs when calling refinePoses directly.
+     *
+     * \attention Appended after multiview_method for the same reset() reason noted above.
+     */
+    int multiview_refine_iterations = 10;
   };
 
   RobustRegistrationSolver() = default;

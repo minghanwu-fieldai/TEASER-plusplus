@@ -125,11 +125,15 @@ teaser::refinePoses(int num_nodes, const std::vector<teaser::PoseRefineEdge>& ed
     comp_edges[result.component[r.p]].push_back(&r);
   }
 
-  auto componentCost = [&](const std::vector<const ReducedEdge*>& es) {
+  // Weighted point cost of a component, evaluated on component-local pose arrays (index = local id).
+  auto localCost = [&](int comp, const std::vector<Eigen::Matrix3d>& Rl,
+                       const std::vector<Eigen::Vector3d>& tl) {
     double cost = 0;
-    for (const ReducedEdge* r : es) {
-      const auto lhs = (result.rotations[r->p] * (*r->p_pts)).colwise() + result.translations[r->p];
-      const auto rhs = (result.rotations[r->q] * (*r->q_pts)).colwise() + result.translations[r->q];
+    for (const ReducedEdge* r : comp_edges[comp]) {
+      const int lp = local_id[r->p];
+      const int lq = local_id[r->q];
+      const auto lhs = (Rl[lp] * (*r->p_pts)).colwise() + tl[lp];
+      const auto rhs = (Rl[lq] * (*r->q_pts)).colwise() + tl[lq];
       const Eigen::Matrix<double, 3, Eigen::Dynamic> diff = lhs - rhs;
       cost += r->edge_weight * (diff.colwise().squaredNorm().array() * r->w->array()).sum();
     }
@@ -144,22 +148,33 @@ teaser::refinePoses(int num_nodes, const std::vector<teaser::PoseRefineEdge>& ed
     }
 
     // Free nodes are the component's nodes minus the anchor (local id 0). Each free node has a
-    // 6-DoF state block [xi (rotation) | dt (translation)], laid out at 6*(local_id - 1).
+    // 6-DoF state block [xi (rotation) | dt (translation)], laid out at 6*(local_id - 1). The
+    // current accepted estimate lives in the local arrays; result.* is only written at the end, so
+    // a rejected trial never touches the returned poses.
     const int dim = 6 * (n - 1);
-    double prev_cost = componentCost(comp_edges[comp]);
+    std::vector<Eigen::Matrix3d> Rloc(n);
+    std::vector<Eigen::Vector3d> tloc(n);
+    for (int k = 0; k < n; ++k) {
+      Rloc[k] = result.rotations[nodes[k]];
+      tloc[k] = result.translations[nodes[k]];
+    }
+    double cur_cost = localCost(comp, Rloc, tloc);
+    double lambda = params.lambda_init;
 
     for (int iter = 0; iter < params.max_iterations; ++iter) {
-      std::vector<Eigen::Triplet<double>> triplets;
-      triplets.reserve(comp_edges[comp].size() * 4 * 144);
+      // --- Gauss-Newton normal equations at the current estimate (undamped). ---
+      std::vector<Eigen::Triplet<double>> base;
+      base.reserve(comp_edges[comp].size() * 4 * 36);
       Eigen::VectorXd g = Eigen::VectorXd::Zero(dim);
+      Eigen::VectorXd diagH = Eigen::VectorXd::Zero(dim);
 
       for (const ReducedEdge* r : comp_edges[comp]) {
         const int lp = local_id[r->p];
         const int lq = local_id[r->q];
-        const Eigen::Matrix3d& Rp = result.rotations[r->p];
-        const Eigen::Matrix3d& Rq = result.rotations[r->q];
-        const Eigen::Vector3d& tp = result.translations[r->p];
-        const Eigen::Vector3d& tq = result.translations[r->q];
+        const Eigen::Matrix3d& Rp = Rloc[lp];
+        const Eigen::Matrix3d& Rq = Rloc[lq];
+        const Eigen::Vector3d& tp = tloc[lp];
+        const Eigen::Vector3d& tq = tloc[lq];
 
         for (Eigen::Index j = 0; j < r->p_pts->cols(); ++j) {
           const double omega = r->edge_weight * (*r->w)(j);
@@ -177,8 +192,6 @@ teaser::refinePoses(int num_nodes, const std::vector<teaser::PoseRefineEdge>& ed
           Jq.leftCols<3>() = Rq * hat(b);
           Jq.rightCols<3>() = -Eigen::Matrix3d::Identity();
 
-          // Accumulate omega * J^T J into H and omega * J^T res into g, dropping the anchor's block
-          // (local id 0). free(l) maps a free local id to its 6-block offset.
           const bool p_free = lp > 0;
           const bool q_free = lq > 0;
           const int op = 6 * (lp - 1);
@@ -189,7 +202,7 @@ teaser::refinePoses(int num_nodes, const std::vector<teaser::PoseRefineEdge>& ed
             const Eigen::Matrix<double, 6, 6> blk = omega * Jr.transpose() * Jc;
             for (int a2 = 0; a2 < 6; ++a2) {
               for (int b2 = 0; b2 < 6; ++b2) {
-                triplets.emplace_back(off_r + a2, off_c + b2, blk(a2, b2));
+                base.emplace_back(off_r + a2, off_c + b2, blk(a2, b2));
               }
             }
           };
@@ -197,10 +210,12 @@ teaser::refinePoses(int num_nodes, const std::vector<teaser::PoseRefineEdge>& ed
           if (p_free) {
             addBlock(op, Jp, op, Jp);
             g.segment<6>(op) += omega * Jp.transpose() * res;
+            diagH.segment<6>(op) += omega * Jp.colwise().squaredNorm().transpose();
           }
           if (q_free) {
             addBlock(oq, Jq, oq, Jq);
             g.segment<6>(oq) += omega * Jq.transpose() * res;
+            diagH.segment<6>(oq) += omega * Jq.colwise().squaredNorm().transpose();
           }
           if (p_free && q_free) {
             addBlock(op, Jp, oq, Jq);
@@ -208,47 +223,90 @@ teaser::refinePoses(int num_nodes, const std::vector<teaser::PoseRefineEdge>& ed
           }
         }
       }
-
-      // Tikhonov damping on the diagonal for rank safety.
       for (int d = 0; d < dim; ++d) {
-        triplets.emplace_back(d, d, params.damping);
+        diagH(d) = std::max(diagH(d), params.min_diagonal);
       }
 
-      Eigen::SparseMatrix<double> H(dim, dim);
-      H.setFromTriplets(triplets.begin(), triplets.end());
-      Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
-      solver.compute(H);
-      if (solver.info() != Eigen::Success) {
-        std::cerr << "[teaser::pose_refine] Warning: factorization failed on component " << comp
-                  << "; stopping refinement for it.\n";
+      // --- Levenberg-Marquardt inner loop: raise lambda until a step lowers the cost. ---
+      bool accepted = false;
+      double rel_decrease = 0;
+      double max_step = 0;
+      while (lambda <= params.lambda_max) {
+        std::vector<Eigen::Triplet<double>> triplets = base;
+        for (int d = 0; d < dim; ++d) {
+          triplets.emplace_back(d, d, lambda * diagH(d));
+        }
+        Eigen::SparseMatrix<double> H(dim, dim);
+        H.setFromTriplets(triplets.begin(), triplets.end());
+        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+        solver.compute(H);
+        if (solver.info() != Eigen::Success) {
+          lambda *= params.lambda_factor;
+          continue;
+        }
+        const Eigen::VectorXd step = solver.solve(-g);
+        if (solver.info() != Eigen::Success) {
+          lambda *= params.lambda_factor;
+          continue;
+        }
+
+        // Trial retraction into scratch arrays; result is untouched unless we accept.
+        std::vector<Eigen::Matrix3d> Rtry = Rloc;
+        std::vector<Eigen::Vector3d> ttry = tloc;
+        for (int k = 1; k < n; ++k) {
+          const int off = 6 * (k - 1);
+          Rtry[k] = Rloc[k] * so3Exp(step.segment<3>(off));
+          ttry[k] = tloc[k] + step.segment<3>(off + 3);
+        }
+        const double trial_cost = localCost(comp, Rtry, ttry);
+
+        if (trial_cost < cur_cost) {
+          rel_decrease = cur_cost > 0 ? (cur_cost - trial_cost) / cur_cost : cur_cost - trial_cost;
+          max_step = step.cwiseAbs().maxCoeff();
+          Rloc.swap(Rtry);
+          tloc.swap(ttry);
+          cur_cost = trial_cost;
+          lambda = std::max(lambda / params.lambda_factor, params.lambda_min);
+          accepted = true;
+          result.iterations[comp] = iter + 1;
+          break;
+        }
+        lambda *= params.lambda_factor; // overshoot: damp harder and retry
+      }
+
+      // No damping level improved the cost -> at a local minimum (or numerically stuck). Stop; the
+      // best estimate so far is already in Rloc/tloc.
+      if (!accepted) {
         break;
       }
-      const Eigen::VectorXd step = solver.solve(-g); // H delta = -g
-      if (solver.info() != Eigen::Success) {
-        std::cerr << "[teaser::pose_refine] Warning: solve failed on component " << comp
-                  << "; stopping refinement for it.\n";
-        break;
-      }
-
-      // Retract each free node: R <- R exp([xi]x), t <- t + dt.
-      for (int k = 1; k < n; ++k) {
-        const int off = 6 * (k - 1);
-        const Eigen::Vector3d xi = step.segment<3>(off);
-        const Eigen::Vector3d dt = step.segment<3>(off + 3);
-        result.rotations[nodes[k]] = result.rotations[nodes[k]] * so3Exp(xi);
-        result.translations[nodes[k]] += dt;
-      }
-      result.iterations[comp] = iter + 1;
-
-      const double cost = componentCost(comp_edges[comp]);
-      const double max_step = step.cwiseAbs().maxCoeff();
-      const double rel_decrease =
-          prev_cost > 0 ? (prev_cost - cost) / prev_cost : std::abs(prev_cost - cost);
-      prev_cost = cost;
-      if (max_step < params.step_tol || std::abs(rel_decrease) < params.cost_tol) {
+      if (max_step < params.step_tol || rel_decrease < params.cost_tol) {
         break;
       }
     }
+
+    // Commit the best (monotonically non-worsening) estimate for this component.
+    for (int k = 0; k < n; ++k) {
+      result.rotations[nodes[k]] = Rloc[k];
+      result.translations[nodes[k]] = tloc[k];
+    }
+  }
+
+  // Diagnostics: how far refinement moved the poses, averaged over the refined nodes.
+  double t_change_sum = 0.0;
+  double r_change_sum = 0.0;
+  int refined_count = 0;
+  for (int i = 0; i < num_nodes; ++i) {
+    if (!result.valid[i]) {
+      continue;
+    }
+    t_change_sum += (result.translations[i] - t_init[i]).norm();
+    const double c = ((R_init[i].transpose() * result.rotations[i]).trace() - 1.0) / 2.0;
+    r_change_sum += std::acos(std::max(-1.0, std::min(1.0, c)));
+    ++refined_count;
+  }
+  if (refined_count > 0) {
+    result.avg_translation_change = t_change_sum / refined_count;
+    result.avg_rotation_change = r_change_sum / refined_count;
   }
 
   return result;

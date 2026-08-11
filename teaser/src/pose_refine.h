@@ -47,18 +47,32 @@ struct PoseRefineEdge {
  * Tuning knobs for refinePoses.
  */
 struct PoseRefineParams {
-  /** Maximum Gauss-Newton iterations per connected component. 0 disables refinement (returns the
-   * initialization unchanged) -- useful as a control in tests. */
+  /** Maximum accepted Levenberg-Marquardt steps per connected component. 0 disables refinement
+   * (returns the initialization unchanged) -- useful as a control and as the off switch. */
   int max_iterations = 10;
-  /** Stop when the largest element of the pose increment falls below this. */
+  /** Stop when the largest element of the accepted pose increment falls below this. */
   double step_tol = 1e-10;
-  /** Stop when the relative cost decrease between iterations falls below this. */
+  /** Stop when the relative cost decrease of an accepted step falls below this. */
   double cost_tol = 1e-12;
   /**
-   * Tikhonov damping added to the diagonal of the normal-equations matrix. Guards against a
-   * rank-deficient Hessian on near-degenerate geometry; small enough to be negligible otherwise.
+   * Initial Levenberg-Marquardt damping. The damped system is (H + lambda * diag(H)) delta = -g
+   * (Marquardt scaling, so it is invariant to variable scale). A trial step is accepted only if it
+   * lowers the cost; on accept lambda shrinks (toward Gauss-Newton), on reject it grows (toward
+   * gradient descent) and the step is retried. Because only cost-decreasing steps are ever
+   * committed, the returned poses are never worse than the initialization -- this is what stops a
+   * bad seed or a surviving outlier from letting a raw Gauss-Newton step overshoot and degrade the
+   * result.
    */
-  double damping = 1e-9;
+  double lambda_init = 1e-3;
+  /** Multiply lambda by this on a rejected step, divide by it on an accepted one. */
+  double lambda_factor = 10.0;
+  /** Lower clamp on lambda (accepted steps stop shrinking it past here). */
+  double lambda_min = 1e-12;
+  /** Give up on the current component once lambda exceeds this (no step can improve). */
+  double lambda_max = 1e12;
+  /** Floor on each diagonal entry used for Marquardt scaling, so unconstrained directions still get
+   * damped. */
+  double min_diagonal = 1e-12;
 };
 
 /**
@@ -75,8 +89,19 @@ struct PoseRefineResult {
   std::vector<int> component;
   /** Number of connected components. */
   int num_components = 0;
-  /** Gauss-Newton iterations actually run, per component (diagnostic). */
+  /** Levenberg-Marquardt steps actually accepted, per component (diagnostic). */
   std::vector<int> iterations;
+  /**
+   * Mean translation displacement ||t_refined - t_init|| over the refined (valid) nodes -- how far
+   * refinement moved the translations on average. Anchors (held fixed) contribute 0. 0 when nothing
+   * was refined.
+   */
+  double avg_translation_change = 0.0;
+  /**
+   * Mean rotation displacement (geodesic angle, radians) between the refined and initial rotations
+   * over the refined nodes. The rotation companion to avg_translation_change.
+   */
+  double avg_rotation_change = 0.0;
 };
 
 /**

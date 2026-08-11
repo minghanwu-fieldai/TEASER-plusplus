@@ -866,6 +866,38 @@ TEST(MultiviewTest, RefinedSpectralAccuracyUnderNoise) {
   EXPECT_LT(spectral_err / (kTrials * 3), 0.05);
 }
 
+// The refinement is optional: multiview_refine_iterations == 0 disables it, giving the raw
+// spectral + Laplacian estimate. Both must still recover a clean scene; the toggle just selects
+// whether the final LM polish runs.
+TEST(MultiviewTest, RefinementToggle) {
+  auto gt = fourPoseGt();
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {0, 3}, {0, 2}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/0, /*noise=*/0.01);
+
+  auto with_refine = makeParams(0.05);
+  with_refine.multiview_refine_iterations = 10;
+  auto without_refine = makeParams(0.05);
+  without_refine.multiview_refine_iterations = 0;
+
+  const auto on =
+      teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, with_refine);
+  const auto off =
+      teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, without_refine);
+
+  ASSERT_EQ(on.num_components, 1);
+  ASSERT_EQ(off.num_components, 1);
+  const Eigen::Matrix3d Ra = gt[0].R;
+  const Eigen::Vector3d ta = gt[0].t;
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_TRUE(on.valid[n]);
+    EXPECT_TRUE(off.valid[n]);
+    const Eigen::Matrix3d R_rel = Ra.transpose() * gt[n].R;
+    const Eigen::Vector3d t_rel = Ra.transpose() * (gt[n].t - ta);
+    EXPECT_LE(teaser::test::getAngularError(R_rel, on.poses[n].R), 2e-2) << "on, node " << n;
+    EXPECT_LE(teaser::test::getAngularError(R_rel, off.poses[n].R), 2e-2) << "off, node " << n;
+  }
+}
+
 // Degenerate input (too few correspondences) is reported as invalid.
 TEST(MultiviewTest, DegenerateInput) {
   teaser::MultiviewSolver solver(makeParams(1e-4));
