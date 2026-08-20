@@ -99,6 +99,33 @@ struct RotationSyncParams {
    * gap unless the dimension exceeds 4.
    */
   int dense_max_dim = 60;
+  /** World "up" direction that the upright prior aligns gravity to. Normalized internally. */
+  Eigen::Vector3d world_up = Eigen::Vector3d::UnitZ();
+  /**
+   * Strength of the optional VIRTUAL-NODE upright prior. 0 (the default) leaves it off.
+   *
+   * When positive, and per-scan gravity is supplied, each component is augmented with a fictitious
+   * "world" node joined to every scan that has a reading, with the rank-one block
+   * eta * g_i * up^T. Because that node touches everything it is a hub: it collapses the graph
+   * diameter and sharply improves conditioning (measured: algebraic connectivity up ~240x on a
+   * 60-node chain).
+   *
+   * The block is rank one, encoding only the two degrees of freedom gravity actually fixes. That
+   * means the ground truth is no longer literally an eigenvector of the augmented matrix -- a
+   * rotation block satisfies (R_q^T R_p) rho_p = rho_q, a rank-deficient one cannot. In practice
+   * this costs nothing when the readings agree with the edges: the truth still saturates every term
+   * of the objective, so recovery stays exact (measured below 1e-5 degrees of relative-rotation
+   * error for eta up to 10 on exact, gravity-consistent data). When gravity DISAGREES with the edge
+   * measurements the prior pulls the solution toward gravity in proportion to eta, which is the
+   * intended behaviour of a prior rather than an artifact -- size eta by how much you trust the
+   * readings relative to the correspondences.
+   *
+   * \attention It does NOT repair an upside-down scan. Gravity constrains pitch and roll and says
+   * nothing about yaw, while a 180-degree flip is a tilt composed with a 180-degree yaw; tested
+   * over eta from 0.05 to 10, the flip always survived. Use `tilt_error` to DETECT flipped scans
+   * and re-estimate them from their neighbours; this prior cannot undo one.
+   */
+  double upright_prior_eta = 0.0;
 };
 
 /**
@@ -123,8 +150,87 @@ struct RotationSyncResult {
    * eigenvalue to exist.
    */
   std::vector<double> spectral_gap;
+  /**
+   * Per component, the four largest eigenvalues (lambda_1 >= ... >= lambda_4, descending) of the
+   * normalized synchronization matrix D^-1/2 B D^-1/2. NaN when the eigendecomposition was not run
+   * or did not converge far enough. Note eigenvalues can legitimately be negative, so NaN -- not a
+   * negative value -- is the "unavailable" marker.
+   *
+   * These measure something DIFFERENT from spectral_gap, and both are worth checking:
+   *
+   * - lambda_1..lambda_3 are all exactly 1 when the measured relative rotations are globally
+   *   consistent (every cycle closes), because then the truth spans the leading eigenspace. So
+   *   1 - lambda_3 is a normalized measure of how INCONSISTENT the data is, independent of how well
+   *   connected the graph is. As a rough reading, a typical per-edge rotation inconsistency of
+   *   angle eps gives 1 - lambda_3 ~ eps^2 / 3.
+   * - spectral_gap (lambda_3 - lambda_4) instead measures IDENTIFIABILITY: whether the top-3
+   *   eigenspace is separated enough for the relaxation to be tight and the rounding stable.
+   *
+   * A graph can be consistent but under-determined (long chain: 1 - lambda_3 tiny, gap tiny), or
+   * well connected but inconsistent (one bad edge: gap fine, 1 - lambda_3 large). Checking only the
+   * gap misses the second case.
+   *
+   * lambda_1 is 1 whenever the component is connected, so use lambda_3 (or the sum over the top
+   * three) rather than lambda_1 as the consistency indicator.
+   */
+  std::vector<Eigen::Vector4d> top_eigenvalues;
+  /**
+   * Per component, the normalized algebraic connectivity (Fiedler value) mu_2 of the n-by-n SCAN
+   * graph -- the second smallest eigenvalue of I - D^-1/2 A D^-1/2, where A_pq = c_pq. NaN for a
+   * component with fewer than two nodes.
+   *
+   * Like spectral_gap, this describes the graph ACTUALLY SOLVED, so it includes the virtual world
+   * node when RotationSyncParams::upright_prior_eta > 0 -- which is exactly how the prior's
+   * conditioning benefit shows up here.
+   *
+   * This is PURE TOPOLOGY: it depends only on which scans are connected and their edge confidences,
+   * never on the measured rotations. It is exposed because on exact (globally consistent) data it
+   * equals the spectral gap identically,
+   *
+   *     lambda_3 - lambda_4  ==  mu_2,
+   *
+   * which follows from B_n = G (A_n kron I_3) G^T -- the spectrum of B_n is the spectrum of the
+   * scalar normalized adjacency A_n with every eigenvalue tripled, so lambda_4 = alpha_2 = 1 - mu_2.
+   *
+   * Comparing the two therefore SEPARATES THE TWO CAUSES of a small gap:
+   *
+   * - gap ~= mu_2, both small  ->  the GRAPH is the problem. It is long and thin (a path scales as
+   *   O(1/n^2)) or nearly split by a weak bridge. No amount of re-solving helps; add overlap between
+   *   the weakly joined clusters, raise the confidence of a trusted bridge edge, or attach an
+   *   absolute prior. mu_2 is cheap to evaluate and to optimize BEFORE running the solve.
+   * - mu_2 healthy but gap << mu_2  ->  the DATA is the problem. The topology could support a
+   *   well-determined answer, but inconsistent relative rotations are dragging lambda_3 below 1.
+   *   Adding edges will not help; look at 1 - lambda_3 (top_eigenvalues) and at which edges carry
+   *   the residual.
+   *
+   * Note mu_2 also measures something 1 - lambda_3 cannot: on a tree or chain there are no cycles,
+   * so ANY set of relative rotations is consistent and 1 - lambda_3 is identically 0 however noisy
+   * the data is. For chain-like graphs mu_2 and the gap are the only informative signals.
+   */
+  std::vector<double> algebraic_connectivity;
   /** Number of connected components over the surviving edges. */
   int num_components = 0;
+  /**
+   * Per node, the residual tilt in RADIANS: the angle between R_i * g_i and world up, i.e. how far
+   * that scan's measured gravity ends up from vertical. NaN when no gravity was supplied for it.
+   *
+   * This is the payoff of the upright gauge and the intended **flip detector**. Without an absolute
+   * reference the gauge is arbitrary and per-node tilt is meaningless -- four perfectly correct
+   * nodes measured 118 degrees of "tilt" purely because the world frame was unpinned. Once the gauge
+   * is upright, a scan whose tilt is an outlier near pi is upside down.
+   *
+   * Note that detecting a flip is not fixing it: gravity leaves yaw free, so repairing a flipped
+   * scan means re-estimating it from its already-posed neighbours.
+   */
+  std::vector<double> tilt_error;
+  /**
+   * Per component, true if the gauge was fixed by aligning gravity to world up, false if it fell
+   * back to pinning the component's lowest-indexed node to the identity (no usable gravity).
+   *
+   * Callers that re-gauge downstream must not undo an upright gauge -- see how
+   * teaser::alignMultiScanWithGraph makes its own re-gauge conditional on this.
+   */
+  std::vector<bool> gauge_upright;
 };
 
 /**
@@ -177,6 +283,12 @@ double timResidualNoiseBound(double delta_p, double delta_q);
  *        used for nodes that end up with no surviving edge. Lets a GNC iteration keep a node's
  *        previous estimate instead of snapping it back to the identity when all of that node's
  *        correspondences are rejected.
+ * @param node_gravity [in] optional per-scan gravity, expressed in each scan's OWN local frame and
+ *        sized num_nodes. Supplying it switches the gauge from "anchor is identity" to "gravity
+ *        points up", which is a pure gauge change and so leaves every relative rotation untouched,
+ *        and it populates `tilt_error`. A zero vector marks a scan with no reading, which is
+ *        skipped. It additionally enables the virtual-node prior when
+ *        RotationSyncParams::upright_prior_eta > 0.
  * @param node_noise_bounds [in] optional per-scan PER-POINT noise bounds (must be sized num_nodes
  *        when given; the TIM composition is what turns a per-point bound into a per-edge one -- see
  *        timResidualNoiseBound). Each edge is then weighted by 1 / sigma_pq^2, so a noisy scan's
@@ -188,6 +300,7 @@ double timResidualNoiseBound(double delta_p, double delta_q);
 RotationSyncResult synchronizeRotations(int num_nodes, const std::vector<RotationSyncEdge>& edges,
                                         const RotationSyncParams& params = RotationSyncParams(),
                                         const std::vector<Eigen::Matrix3d>* initial = nullptr,
-                                        const std::vector<double>* node_noise_bounds = nullptr);
+                                        const std::vector<double>* node_noise_bounds = nullptr,
+                                        const std::vector<Eigen::Vector3d>* node_gravity = nullptr);
 
 } // namespace teaser

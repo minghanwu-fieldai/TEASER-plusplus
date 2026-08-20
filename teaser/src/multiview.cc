@@ -525,7 +525,8 @@ teaser::MultiScanResult alignAlongGraph(
     const std::vector<std::pair<int, int>>& graph_edges, const std::vector<double>& anchor_score,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
     const teaser::RobustRegistrationSolver::Params& params, const std::vector<int>& order,
-    const std::map<std::pair<int, int>, double>& edge_weight) {
+    const std::map<std::pair<int, int>, double>& edge_weight,
+    const teaser::UprightPrior& upright) {
   const int N = static_cast<int>(clouds.size());
   teaser::MultiScanResult result;
   result.poses.assign(N, teaser::Pose{});
@@ -695,6 +696,22 @@ teaser::MultiScanResult alignAlongGraph(
     }
   }
 
+  // Upright prior. Gravity is per-scan data; when absent everything below is a no-op and the solver
+  // behaves exactly as it did before the prior existed.
+  teaser::RotationSyncParams rot_sync_params;
+  rot_sync_params.world_up = upright.world_up;
+  rot_sync_params.upright_prior_eta = upright.virtual_node_eta;
+  const std::vector<Eigen::Vector3d>* gravity_ptr =
+      upright.gravity.empty() ? nullptr : &upright.gravity;
+  if (gravity_ptr != nullptr && static_cast<int>(upright.gravity.size()) != N) {
+    std::cerr << "[teaser::multiview] Warning: UprightPrior::gravity has "
+              << upright.gravity.size() << " entries but there are " << N
+              << " scans; ignoring the upright prior.\n";
+    gravity_ptr = nullptr;
+  }
+  std::vector<char> node_upright(N, 0);
+  std::vector<double> tilt_error;
+
   std::vector<Eigen::Matrix3d> R(N, Eigen::Matrix3d::Identity());
   std::vector<Eigen::Vector3d> t(N, Eigen::Vector3d::Zero());
   std::vector<bool> rot_valid(N, false);
@@ -729,10 +746,23 @@ teaser::MultiScanResult alignAlongGraph(
       }
       // Passing the current estimate keeps a node that has just lost all its edges to the weight
       // update from snapping back to the identity.
-      const teaser::RotationSyncResult sync =
-          teaser::synchronizeRotations(N, sync_edges, teaser::RotationSyncParams(), &R);
+      const teaser::RotationSyncResult sync = teaser::synchronizeRotations(
+          N, sync_edges, rot_sync_params, &R, /*node_noise_bounds=*/nullptr, gravity_ptr);
       R = sync.rotations;
       rot_valid = sync.valid;
+      // Remember per node whether its component's gauge was made upright. The sync helper labels
+      // components itself (edgeless nodes get -1), which need not match this driver's labeling, so
+      // carry the flag per node rather than per component id.
+      if (gravity_ptr != nullptr) {
+        for (int i = 0; i < N; ++i) {
+          const int sc = sync.component[i];
+          node_upright[i] = (sc >= 0 && sc < static_cast<int>(sync.gauge_upright.size()) &&
+                             sync.gauge_upright[sc])
+                                ? 1
+                                : 0;
+        }
+        tilt_error = sync.tilt_error;
+      }
 
       for (size_t e = 0; e < prepared.size(); ++e) {
         const Pts diff =
@@ -816,15 +846,39 @@ teaser::MultiScanResult alignAlongGraph(
     if (a < 0) {
       continue;
     }
-    const Eigen::Matrix3d Ra = R[a];
+    // When the rotation stage already fixed this component's gauge by gravity, re-expressing
+    // everything in the anchor's frame would UNDO that and hand back a tilted map. Keep the upright
+    // frame and only zero the anchor's translation (the translation gauge is additive, so it is
+    // independent of the rotation gauge).
+    const Eigen::Matrix3d Ra =
+        node_upright[a] ? Eigen::Matrix3d::Identity() : Eigen::Matrix3d(R[a].transpose());
     const Eigen::Vector3d ta = t[a];
     for (int i = 0; i < N; ++i) {
       if (result.component[i] != c) {
         continue;
       }
-      result.poses[i].R = Ra.transpose() * R[i];
-      result.poses[i].t = Ra.transpose() * (t[i] - ta);
+      result.poses[i].R = Ra * R[i];
+      result.poses[i].t = Ra * (t[i] - ta);
       result.valid[i] = is_anchor[i] || (rot_valid[i] && trans_valid[i]);
+    }
+  }
+  if (!tilt_error.empty()) {
+    int worst = -1;
+    double worst_tilt = -1.0;
+    for (int i = 0; i < N; ++i) {
+      if (result.valid[i] && i < static_cast<int>(tilt_error.size()) &&
+          std::isfinite(tilt_error[i]) && tilt_error[i] > worst_tilt) {
+        worst_tilt = tilt_error[i];
+        worst = i;
+      }
+    }
+    if (worst >= 0) {
+      std::cerr << "[teaser::multiview] upright prior: worst residual tilt "
+                << worst_tilt * 180.0 / M_PI << " deg at scan " << worst
+                << (worst_tilt > M_PI / 2
+                        ? " -- that scan is UPSIDE DOWN; gravity cannot repair it (yaw is"
+                          " unconstrained), re-estimate it from its neighbours.\n"
+                        : ".\n");
     }
   }
   for (int i = 0; i < N; ++i) {
@@ -879,7 +933,8 @@ teaser::MultiScanResult teaser::alignMultiScan(
     const std::vector<teaser::PointCloud>& clouds, const teaser::Graph& adjacency,
     const std::map<std::pair<int, int>, double>& edge_weights,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
-    const teaser::RobustRegistrationSolver::Params& params) {
+    const teaser::RobustRegistrationSolver::Params& params,
+    const teaser::UprightPrior& upright) {
   const int N = static_cast<int>(clouds.size());
   teaser::MultiScanResult result;
   result.poses.assign(N, teaser::Pose{});
@@ -936,7 +991,7 @@ teaser::MultiScanResult teaser::alignMultiScan(
   }
 
   return alignAlongGraph(clouds, selected_edges, anchor_score, correspondences, params, /*order=*/{},
-                         /*edge_weight=*/{});
+                         /*edge_weight=*/{}, upright);
 }
 
 teaser::MultiScanResult teaser::alignMultiScanWithGraph(
@@ -944,7 +999,7 @@ teaser::MultiScanResult teaser::alignMultiScanWithGraph(
     const std::vector<std::pair<int, int>>& graph_edges,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
     const teaser::RobustRegistrationSolver::Params& params, const std::vector<int>& order,
-    const std::vector<double>& edge_weights) {
+    const std::vector<double>& edge_weights, const teaser::UprightPrior& upright) {
   const int N = static_cast<int>(clouds.size());
   // Score anchors by degree: the most-connected node in the caller-provided graph is the root.
   // (Used only when no explicit order is given; an order overrides anchor selection.)
@@ -970,5 +1025,5 @@ teaser::MultiScanResult teaser::alignMultiScanWithGraph(
     }
   }
   return alignAlongGraph(clouds, graph_edges, anchor_score, correspondences, params, order,
-                         edge_weight);
+                         edge_weight, upright);
 }

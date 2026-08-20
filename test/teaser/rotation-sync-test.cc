@@ -168,6 +168,369 @@ TEST(RotationSyncTest, CycleHasLargerSpectralGapThanChain) {
   EXPECT_GT(cycle_res.spectral_gap[0], chain_res.spectral_gap[0]);
 }
 
+// The top-4 eigenvalues of the normalized synchronization matrix are exposed as a diagnostic.
+// On globally consistent data the truth spans the leading eigenspace, so lambda_1..lambda_3 are
+// exactly 1; 1 - lambda_3 therefore measures data INCONSISTENCY, which is a different quantity from
+// the spectral gap (identifiability). This pins both facts.
+TEST(RotationSyncTest, ReportsTopEigenvalues) {
+  std::vector<Mat3> R_gt = {randomRotation(), randomRotation(), randomRotation(), randomRotation()};
+
+  // Noise-free 4-cycle: perfectly consistent.
+  std::vector<teaser::RotationSyncEdge> clean = {
+      makeEdge(0, 1, R_gt, 30), makeEdge(1, 2, R_gt, 30), makeEdge(2, 3, R_gt, 30),
+      makeEdge(0, 3, R_gt, 30)};
+  const auto clean_res = teaser::synchronizeRotations(4, clean);
+  ASSERT_EQ(clean_res.num_components, 1);
+  ASSERT_EQ(clean_res.top_eigenvalues.size(), 1u);
+  const Eigen::Vector4d& lc = clean_res.top_eigenvalues[0];
+  for (int k = 0; k < 4; ++k) {
+    EXPECT_FALSE(std::isnan(lc(k))) << "lambda_" << k + 1 << " should be available";
+  }
+  // Descending, bounded by 1 (spectral radius <= 1), and the top three are exactly 1.
+  EXPECT_GE(lc(0), lc(1));
+  EXPECT_GE(lc(1), lc(2));
+  EXPECT_GE(lc(2), lc(3));
+  EXPECT_LE(lc(0), 1.0 + 1e-12);
+  for (int k = 0; k < 3; ++k) {
+    EXPECT_NEAR(lc(k), 1.0, 1e-9) << "lambda_" << k + 1 << " on consistent data";
+  }
+  // The reported gap is exactly lambda_3 - lambda_4, so the two diagnostics cannot disagree.
+  EXPECT_NEAR(clean_res.spectral_gap[0], lc(2) - lc(3), 1e-12);
+
+  // Same graph, noisy: still identifiable (gap stays healthy) but no longer consistent, so
+  // lambda_3 drops below 1. This is the case a gap-only check would miss.
+  std::vector<teaser::RotationSyncEdge> noisy = {
+      makeEdge(0, 1, R_gt, 30, 0.08), makeEdge(1, 2, R_gt, 30, 0.08),
+      makeEdge(2, 3, R_gt, 30, 0.08), makeEdge(0, 3, R_gt, 30, 0.08)};
+  const auto noisy_res = teaser::synchronizeRotations(4, noisy);
+  ASSERT_EQ(noisy_res.num_components, 1);
+  const Eigen::Vector4d& ln = noisy_res.top_eigenvalues[0];
+  EXPECT_LT(ln(2), 1.0 - 1e-12) << "inconsistent data must push lambda_3 below 1";
+  EXPECT_LT(1.0 - lc(2), 1.0 - ln(2)) << "noisy data must be less consistent than clean";
+  EXPECT_NEAR(noisy_res.spectral_gap[0], ln(2) - ln(3), 1e-12);
+}
+
+// The normalized algebraic connectivity mu_2 of the n-by-n scan graph is reported alongside the
+// spectral gap. On exact data the two are IDENTICAL (B_n is orthogonally similar to A_n kron I_3),
+// which is what lets their difference separate a thin graph from inconsistent data.
+TEST(RotationSyncTest, ReportsAlgebraicConnectivity) {
+  std::vector<Mat3> R_gt = {randomRotation(), randomRotation(), randomRotation(), randomRotation()};
+  std::vector<teaser::RotationSyncEdge> cycle = {
+      makeEdge(0, 1, R_gt, 30), makeEdge(1, 2, R_gt, 30), makeEdge(2, 3, R_gt, 30),
+      makeEdge(0, 3, R_gt, 30)};
+
+  const auto exact = teaser::synchronizeRotations(4, cycle);
+  ASSERT_EQ(exact.num_components, 1);
+  ASSERT_EQ(exact.algebraic_connectivity.size(), 1u);
+  const double mu2 = exact.algebraic_connectivity[0];
+  ASSERT_FALSE(std::isnan(mu2));
+  EXPECT_GT(mu2, 0.0) << "connected component must have positive connectivity";
+  // The identity gap == mu_2, exactly.
+  EXPECT_NEAR(exact.spectral_gap[0], mu2, 1e-9);
+
+  // mu_2 is PURE TOPOLOGY: same graph, entirely different ground-truth rotations, same mu_2.
+  std::vector<Mat3> R_other = {randomRotation(), randomRotation(), randomRotation(),
+                               randomRotation()};
+  std::vector<teaser::RotationSyncEdge> same_graph = {
+      makeEdge(0, 1, R_other, 30), makeEdge(1, 2, R_other, 30), makeEdge(2, 3, R_other, 30),
+      makeEdge(0, 3, R_other, 30)};
+  const auto other = teaser::synchronizeRotations(4, same_graph);
+  EXPECT_NEAR(other.algebraic_connectivity[0], mu2, 1e-9);
+
+  // A chain is thinner than a cycle, so it has strictly lower connectivity -- and the reported gap
+  // tracks it, since both are exact-data cases.
+  std::vector<teaser::RotationSyncEdge> chain = {
+      makeEdge(0, 1, R_gt, 30), makeEdge(1, 2, R_gt, 30), makeEdge(2, 3, R_gt, 30)};
+  const auto chain_res = teaser::synchronizeRotations(4, chain);
+  EXPECT_LT(chain_res.algebraic_connectivity[0], mu2);
+  EXPECT_NEAR(chain_res.spectral_gap[0], chain_res.algebraic_connectivity[0], 1e-9);
+
+  // Inconsistent data leaves the topology untouched but drags the gap BELOW mu_2. That shortfall is
+  // the data's contribution, and is exactly what the two numbers together diagnose.
+  std::vector<teaser::RotationSyncEdge> noisy = {
+      makeEdge(0, 1, R_gt, 30, 0.12), makeEdge(1, 2, R_gt, 30, 0.12),
+      makeEdge(2, 3, R_gt, 30, 0.12), makeEdge(0, 3, R_gt, 30, 0.12)};
+  const auto noisy_res = teaser::synchronizeRotations(4, noisy);
+  EXPECT_NEAR(noisy_res.algebraic_connectivity[0], mu2, 1e-9)
+      << "mu_2 must not move: the graph is unchanged";
+  EXPECT_LT(noisy_res.spectral_gap[0], noisy_res.algebraic_connectivity[0])
+      << "inconsistent data must pull the gap below the topology bound";
+}
+
+// REGRESSION: a long chain has a heavily clustered spectrum, and B_n's eigenvalues come in triples,
+// which the iterative eigensolver used to mis-resolve -- it reported a gap 5x too large (or ~0,
+// depending on nev) on exactly the thin graphs the gap diagnostic exists to flag. The identity
+// gap == mu_2 on exact data is the check: mu_2 comes from the reliable n-by-n spectrum, so agreement
+// validates the 3n-by-3n solve. Sized to force the sparse path (dim = 3*40 > dense_max_dim).
+TEST(RotationSyncTest, SparsePathResolvesClusteredSpectrum) {
+  constexpr int kNodes = 40;
+  std::vector<Mat3> R_gt;
+  for (int i = 0; i < kNodes; ++i) {
+    R_gt.push_back(randomRotation());
+  }
+  std::vector<teaser::RotationSyncEdge> chain;
+  for (int i = 0; i + 1 < kNodes; ++i) {
+    chain.push_back(makeEdge(i, i + 1, R_gt, 12));
+  }
+
+  teaser::RotationSyncParams sparse_params; // default dense_max_dim = 60 < 120 -> iterative
+  const auto sp = teaser::synchronizeRotations(kNodes, chain, sparse_params);
+  teaser::RotationSyncParams dense_params;
+  dense_params.dense_max_dim = 100000; // force dense
+  const auto dn = teaser::synchronizeRotations(kNodes, chain, dense_params);
+
+  ASSERT_EQ(sp.num_components, 1);
+  ASSERT_EQ(dn.num_components, 1);
+  // mu_2 is topology only, so the two runs must agree on it regardless of solver path.
+  EXPECT_NEAR(sp.algebraic_connectivity[0], dn.algebraic_connectivity[0], 1e-12);
+  // The identity, through BOTH solver paths.
+  EXPECT_NEAR(dn.spectral_gap[0], dn.algebraic_connectivity[0], 1e-9);
+  EXPECT_NEAR(sp.spectral_gap[0], sp.algebraic_connectivity[0], 1e-9)
+      << "iterative solver failed to resolve the clustered/degenerate spectrum";
+  EXPECT_NEAR(sp.spectral_gap[0], dn.spectral_gap[0], 1e-9);
+  // And the graph really is thin, so this exercises the hard regime rather than an easy one.
+  EXPECT_LT(dn.spectral_gap[0], 5e-3);
+  expectMatchesGroundTruth(sp, R_gt, {0, 1, kNodes - 1}, 1e-6);
+}
+
+// ===================== upright (gravity) prior =====================
+namespace {
+// Exact gravity in each scan's own local frame, for ground-truth rotations R_gt.
+std::vector<Eigen::Vector3d> exactGravity(const std::vector<Mat3>& R_gt,
+                                          const Eigen::Vector3d& up = Eigen::Vector3d::UnitZ()) {
+  std::vector<Eigen::Vector3d> g;
+  g.reserve(R_gt.size());
+  for (const auto& R : R_gt) {
+    g.push_back(R.transpose() * up);
+  }
+  return g;
+}
+double tiltDeg(double rad) { return rad * 180.0 / M_PI; }
+// Geodesic angle between two rotations, in degrees.
+double angDeg(const Mat3& A, const Mat3& B) {
+  const double c = ((A.transpose() * B).trace() - 1.0) / 2.0;
+  return std::acos(std::max(-1.0, std::min(1.0, c))) * 180.0 / M_PI;
+}
+} // namespace
+
+// The upright gauge is a GAUGE change: it picks a different global rotation, so it must leave every
+// relative rotation bit-for-bit alone. This is the load-bearing guarantee that makes it safe to
+// apply unconditionally.
+TEST(RotationSyncTest, UprightGaugeIsZeroBias) {
+  std::vector<Mat3> R_gt = {randomRotation(), randomRotation(), randomRotation(), randomRotation()};
+  std::vector<teaser::RotationSyncEdge> edges = {
+      makeEdge(0, 1, R_gt, 25, 0.02), makeEdge(1, 2, R_gt, 25, 0.02),
+      makeEdge(2, 3, R_gt, 25, 0.02), makeEdge(0, 3, R_gt, 25, 0.02)};
+  const auto g = exactGravity(R_gt);
+
+  const auto plain = teaser::synchronizeRotations(4, edges);
+  const auto up = teaser::synchronizeRotations(4, edges, teaser::RotationSyncParams(), nullptr,
+                                               nullptr, &g);
+  ASSERT_EQ(up.num_components, 1);
+  ASSERT_EQ(up.gauge_upright.size(), 1u);
+  EXPECT_TRUE(up.gauge_upright[0]);
+  EXPECT_FALSE(plain.gauge_upright[0]);
+
+  // Relative rotations identical...
+  for (int i = 0; i < 4; ++i) {
+    for (int j = i + 1; j < 4; ++j) {
+      expectRotationNear(up.rotations[i].transpose() * up.rotations[j],
+                         plain.rotations[i].transpose() * plain.rotations[j], 1e-12);
+    }
+  }
+  // ...while the absolute frame genuinely moved (otherwise the test proves nothing).
+  EXPECT_GT((up.rotations[0] - plain.rotations[0]).norm(), 1e-6);
+  // The plain gauge pins the anchor; the upright gauge does not.
+  expectRotationNear(plain.rotations[0], Mat3::Identity(), 1e-12);
+}
+
+// With exact gravity the output frame is actually upright: every scan's measured gravity maps to up.
+TEST(RotationSyncTest, UprightGaugeStandsTheMapUp) {
+  std::vector<Mat3> R_gt = {randomRotation(), randomRotation(), randomRotation()};
+  std::vector<teaser::RotationSyncEdge> edges = {
+      makeEdge(0, 1, R_gt, 30), makeEdge(1, 2, R_gt, 30), makeEdge(0, 2, R_gt, 30)};
+  const auto g = exactGravity(R_gt);
+  const auto res =
+      teaser::synchronizeRotations(3, edges, teaser::RotationSyncParams(), nullptr, nullptr, &g);
+  ASSERT_EQ(res.num_components, 1);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_FALSE(std::isnan(res.tilt_error[i]));
+    EXPECT_LT(tiltDeg(res.tilt_error[i]), 1e-4) << "node " << i;
+    expectRotationNear(res.rotations[i] * R_gt[i].transpose(), res.rotations[0] * R_gt[0].transpose(),
+                       1e-9); // one common gauge for all
+  }
+}
+
+// The point of the gauge: per-node tilt becomes a flip DETECTOR. Node 3's edge measurement says it
+// is upside down while its gravity reading says otherwise, so its tilt must be a clear outlier.
+TEST(RotationSyncTest, TiltErrorDetectsAFlippedScan) {
+  std::vector<Mat3> R_gt = {randomRotation(), randomRotation(), randomRotation(), randomRotation()};
+  // "Upside down" means the WORLD up-axis is inverted, so the flip is a 180-degree rotation about a
+  // HORIZONTAL world axis, applied on the left. Flipping about the body axis instead would give an
+  // arbitrary axis relative to gravity, and a 180-degree flip about the VERTICAL is pure yaw --
+  // invisible to gravity, and rightly so, since it does not change which way is up.
+  const Mat3 flip = Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitX()).toRotationMatrix();
+  // Measurements: nodes 0-2 consistent; node 3 attached only to node 0, measured FLIPPED.
+  std::vector<Mat3> R_meas = R_gt;
+  R_meas[3] = flip * R_gt[3];
+  std::vector<teaser::RotationSyncEdge> edges = {
+      makeEdge(0, 1, R_meas, 30), makeEdge(1, 2, R_meas, 30), makeEdge(0, 2, R_meas, 30),
+      makeEdge(0, 3, R_meas, 30)};
+  const auto g = exactGravity(R_gt); // gravity reflects the TRUE orientation
+
+  const auto res =
+      teaser::synchronizeRotations(4, edges, teaser::RotationSyncParams(), nullptr, nullptr, &g);
+  ASSERT_EQ(res.num_components, 1);
+  ASSERT_TRUE(res.gauge_upright[0]);
+  const double bad = tiltDeg(res.tilt_error[3]);
+  double worst_good = 0;
+  for (int i = 0; i < 3; ++i) {
+    worst_good = std::max(worst_good, tiltDeg(res.tilt_error[i]));
+  }
+  EXPECT_GT(bad, 90.0) << "the flipped scan should read near 180 deg of tilt";
+  EXPECT_GT(bad, worst_good + 45.0) << "flipped=" << bad << " worst good=" << worst_good;
+
+  // Falsifiable: WITHOUT the upright gauge the tilts are meaningless, so no such separation exists.
+  const auto plain = teaser::synchronizeRotations(4, edges);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_TRUE(std::isnan(plain.tilt_error[i])) << "no gravity -> no tilt reported";
+  }
+}
+
+// The virtual node is a hub, so it collapses the graph diameter and lifts the algebraic
+// connectivity of the graph actually solved. That conditioning gain is its whole purpose.
+TEST(RotationSyncTest, VirtualNodeImprovesConnectivity) {
+  constexpr int kNodes = 12;
+  std::vector<Mat3> R_gt;
+  for (int i = 0; i < kNodes; ++i) {
+    R_gt.push_back(randomRotation());
+  }
+  std::vector<teaser::RotationSyncEdge> chain; // a thin chain: worst case for connectivity
+  for (int i = 0; i + 1 < kNodes; ++i) {
+    chain.push_back(makeEdge(i, i + 1, R_gt, 15));
+  }
+  const auto g = exactGravity(R_gt);
+
+  teaser::RotationSyncParams off; // eta = 0 -> gauge only, no virtual node
+  const auto a = teaser::synchronizeRotations(kNodes, chain, off, nullptr, nullptr, &g);
+  teaser::RotationSyncParams on;
+  on.upright_prior_eta = 1.0;
+  const auto b = teaser::synchronizeRotations(kNodes, chain, on, nullptr, nullptr, &g);
+
+  ASSERT_EQ(a.num_components, 1);
+  ASSERT_EQ(b.num_components, 1);
+  EXPECT_GT(b.algebraic_connectivity[0], 5.0 * a.algebraic_connectivity[0])
+      << "eta=0: " << a.algebraic_connectivity[0] << "  eta=1: " << b.algebraic_connectivity[0];
+}
+
+// The virtual node does NOT bias the estimate when gravity agrees with the edge measurements: the
+// truth saturates every term of the objective, the real edges and the gravity terms alike, so it
+// stays the maximizer however strong the prior is. When gravity DISAGREES with the edges the prior
+// does pull the solution, in proportion to eta -- which is a genuine trade-off between two
+// information sources, not an artifact. Both halves are pinned here.
+TEST(RotationSyncTest, VirtualNodeBiasOnlyWhenGravityDisagrees) {
+  std::vector<Mat3> R_gt = {randomRotation(), randomRotation(), randomRotation(), randomRotation()};
+  std::vector<teaser::RotationSyncEdge> edges = {
+      makeEdge(0, 1, R_gt, 30), makeEdge(1, 2, R_gt, 30), makeEdge(2, 3, R_gt, 30),
+      makeEdge(0, 3, R_gt, 30), makeEdge(0, 2, R_gt, 30)};
+
+  auto maxRelErrDeg = [&](double eta, const std::vector<Eigen::Vector3d>& g) {
+    teaser::RotationSyncParams pp;
+    pp.upright_prior_eta = eta;
+    const auto r = teaser::synchronizeRotations(4, edges, pp, nullptr, nullptr, &g);
+    double worst = 0;
+    for (int i = 0; i < 4; ++i) {
+      for (int j = i + 1; j < 4; ++j) {
+        worst = std::max(worst, angDeg(R_gt[i].transpose() * R_gt[j],
+                                       r.rotations[i].transpose() * r.rotations[j]));
+      }
+    }
+    return worst;
+  };
+
+  // (a) Gravity consistent with the rotations: bias-free at ANY strength.
+  const auto g_exact = exactGravity(R_gt);
+  for (double eta : {0.0, 0.1, 1.0, 10.0}) {
+    EXPECT_LT(maxRelErrDeg(eta, g_exact), 1e-3) << "eta = " << eta;
+  }
+
+  // (b) Gravity readings tilted 5 degrees off: now the prior competes with the edges, and its pull
+  // grows with eta. Averaged over the node set, so this is a trend rather than one lucky pair.
+  std::vector<Eigen::Vector3d> g_bad = g_exact;
+  for (auto& g : g_bad) {
+    Eigen::Vector3d axis = Eigen::Vector3d::UnitX();
+    axis = (axis - g.dot(axis) * g).normalized();
+    g = Eigen::AngleAxisd(5.0 * M_PI / 180.0, axis).toRotationMatrix() * g;
+  }
+  const double weak = maxRelErrDeg(0.05, g_bad);
+  const double strong = maxRelErrDeg(5.0, g_bad);
+  EXPECT_GT(strong, weak) << "weak=" << weak << " strong=" << strong;
+  EXPECT_LT(weak, 0.5) << "a weak prior should barely move the estimate";
+}
+
+// The virtual node is added PER COMPONENT. One world node joined to every scan would otherwise merge
+// disconnected components, reporting them as one while their relative yaw stays unconstrained.
+TEST(RotationSyncTest, VirtualNodeDoesNotMergeComponents) {
+  std::vector<Mat3> R_gt;
+  for (int i = 0; i < 6; ++i) {
+    R_gt.push_back(randomRotation());
+  }
+  std::vector<teaser::RotationSyncEdge> edges = {
+      makeEdge(0, 1, R_gt, 20), makeEdge(1, 2, R_gt, 20), makeEdge(0, 2, R_gt, 20),
+      makeEdge(3, 4, R_gt, 20), makeEdge(4, 5, R_gt, 20), makeEdge(3, 5, R_gt, 20)};
+  const auto g = exactGravity(R_gt);
+  teaser::RotationSyncParams pp;
+  pp.upright_prior_eta = 1.0;
+  const auto res = teaser::synchronizeRotations(6, edges, pp, nullptr, nullptr, &g);
+
+  EXPECT_EQ(res.num_components, 2);
+  EXPECT_EQ(res.component[0], res.component[2]);
+  EXPECT_NE(res.component[0], res.component[3]);
+  // Both components independently upright.
+  for (int i = 0; i < 6; ++i) {
+    EXPECT_LT(tiltDeg(res.tilt_error[i]), 1e-4) << "node " << i;
+  }
+}
+
+TEST(RotationSyncTest, UprightPriorDegenerateInputs) {
+  std::vector<Mat3> R_gt = {randomRotation(), randomRotation(), randomRotation()};
+  std::vector<teaser::RotationSyncEdge> edges = {
+      makeEdge(0, 1, R_gt, 20), makeEdge(1, 2, R_gt, 20), makeEdge(0, 2, R_gt, 20)};
+  const auto plain = teaser::synchronizeRotations(3, edges);
+
+  // Wrong size -> ignored, falls back to the anchor gauge.
+  const std::vector<Eigen::Vector3d> bad_size(2, Eigen::Vector3d::UnitZ());
+  const auto a = teaser::synchronizeRotations(3, edges, teaser::RotationSyncParams(), nullptr,
+                                              nullptr, &bad_size);
+  EXPECT_FALSE(a.gauge_upright[0]);
+  expectRotationNear(a.rotations[0], plain.rotations[0], 1e-12);
+
+  // All-zero gravity -> no usable reading, anchor gauge, NaN tilts.
+  const std::vector<Eigen::Vector3d> zeros(3, Eigen::Vector3d::Zero());
+  const auto b =
+      teaser::synchronizeRotations(3, edges, teaser::RotationSyncParams(), nullptr, nullptr, &zeros);
+  EXPECT_FALSE(b.gauge_upright[0]);
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_TRUE(std::isnan(b.tilt_error[i]));
+  }
+
+  // Degenerate world_up -> prior ignored entirely.
+  const auto g = exactGravity(R_gt);
+  teaser::RotationSyncParams zero_up;
+  zero_up.world_up = Eigen::Vector3d::Zero();
+  const auto c = teaser::synchronizeRotations(3, edges, zero_up, nullptr, nullptr, &g);
+  EXPECT_FALSE(c.gauge_upright[0]);
+
+  // Partial coverage: only one scan has a reading. Still enough to define the gauge.
+  std::vector<Eigen::Vector3d> partial(3, Eigen::Vector3d::Zero());
+  partial[1] = g[1];
+  const auto d = teaser::synchronizeRotations(3, edges, teaser::RotationSyncParams(), nullptr,
+                                              nullptr, &partial);
+  EXPECT_TRUE(d.gauge_upright[0]);
+  EXPECT_LT(tiltDeg(d.tilt_error[1]), 1e-4);
+  EXPECT_TRUE(std::isnan(d.tilt_error[0]));
+}
+
 // The reason the helper exists: sequential propagation along a chain accumulates drift and cannot
 // absorb a loop closure, while joint synchronization distributes the error over all edges.
 TEST(RotationSyncTest, JointSolveBeatsSequentialPropagation) {

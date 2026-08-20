@@ -898,6 +898,68 @@ TEST(MultiviewTest, RefinementToggle) {
   }
 }
 
+// End-to-end upright prior: supplying gravity makes the OUTPUT FRAME upright rather than pinning
+// the anchor to the identity, while leaving the relative poses (the actual estimate) intact.
+TEST(MultiviewTest, UprightPriorStandsTheOutputUp) {
+  auto gt = fourPoseGt();
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {0, 3}, {0, 2}};
+  auto scene = buildScene(gt, graph, /*k_in=*/30, /*k_out=*/0, /*noise=*/0.005);
+
+  const Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
+  teaser::UprightPrior prior;
+  for (int i = 0; i < 4; ++i) {
+    prior.gravity.push_back(gt[i].R.transpose() * up); // gravity in each scan's local frame
+  }
+
+  const auto plain =
+      teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(0.05));
+  const auto upr = teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr,
+                                                   makeParams(0.05), {}, {}, prior);
+  ASSERT_EQ(upr.num_components, 1);
+
+  // The frame is upright: each scan's measured gravity maps to world up.
+  for (int n = 0; n < 4; ++n) {
+    ASSERT_TRUE(upr.valid[n]);
+    const Eigen::Vector3d mapped = upr.poses[n].R * prior.gravity[n];
+    EXPECT_LT(std::acos(std::max(-1.0, std::min(1.0, mapped.dot(up)))) * 180.0 / M_PI, 2.0)
+        << "scan " << n << " is not upright";
+  }
+  // The anchor is NO LONGER the identity rotation -- the gauge is upright instead. Its translation
+  // is still zero, since the translation gauge is independent.
+  EXPECT_FALSE(upr.poses[0].R.isApprox(Eigen::Matrix3d::Identity(), 1e-6));
+  EXPECT_LT(upr.poses[0].t.norm(), 1e-9);
+  EXPECT_TRUE(plain.poses[0].R.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
+
+  // The estimate itself is unchanged: relative poses match the no-prior run, and both match GT.
+  for (int i = 0; i < 4; ++i) {
+    for (int j = i + 1; j < 4; ++j) {
+      const Eigen::Matrix3d rel_up = upr.poses[i].R.transpose() * upr.poses[j].R;
+      const Eigen::Matrix3d rel_pl = plain.poses[i].R.transpose() * plain.poses[j].R;
+      EXPECT_LE(teaser::test::getAngularError(rel_pl, rel_up), 1e-9) << i << "," << j;
+      EXPECT_LE(teaser::test::getAngularError(gt[i].R.transpose() * gt[j].R, rel_up), 2e-2);
+    }
+  }
+}
+
+// A default-constructed UprightPrior must be indistinguishable from not passing one at all.
+TEST(MultiviewTest, UprightPriorDefaultIsBackwardCompatible) {
+  auto gt = fourPoseGt();
+  std::vector<std::pair<int, int>> graph = {{0, 1}, {1, 2}, {2, 3}, {0, 3}};
+  auto scene = buildScene(gt, graph, /*k_in=*/25, /*k_out=*/5);
+
+  const auto omitted =
+      teaser::alignMultiScanWithGraph(scene.clouds, graph, scene.corr, makeParams(1e-3));
+  const auto defaulted = teaser::alignMultiScanWithGraph(
+      scene.clouds, graph, scene.corr, makeParams(1e-3), {}, {}, teaser::UprightPrior());
+  ASSERT_EQ(omitted.num_components, defaulted.num_components);
+  for (int n = 0; n < 4; ++n) {
+    EXPECT_EQ(omitted.valid[n], defaulted.valid[n]);
+    EXPECT_TRUE(omitted.poses[n].R.isApprox(defaulted.poses[n].R, 0.0)) << "scan " << n;
+    EXPECT_TRUE(omitted.poses[n].t.isApprox(defaulted.poses[n].t, 0.0)) << "scan " << n;
+  }
+  EXPECT_EQ(omitted.edge_residual, defaulted.edge_residual);
+}
+
 // Degenerate input (too few correspondences) is reported as invalid.
 TEST(MultiviewTest, DegenerateInput) {
   teaser::MultiviewSolver solver(makeParams(1e-4));

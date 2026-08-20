@@ -160,6 +160,54 @@ struct MultiScanResult {
 };
 
 /**
+ * Optional gravity ("upright") prior for the multi-scan solvers.
+ *
+ * The rotation stage only ever sees RELATIVE rotations, so the recovered frame is arbitrary and a
+ * scan that comes out upside down -- a 180-degree rotation, which is a perfectly proper rotation --
+ * is invisible. Supplying gravity adds the missing absolute reference. Default-constructed, this
+ * struct disables the prior entirely and the solvers behave exactly as before.
+ *
+ * Two mechanisms, with very different cost:
+ *
+ * 1. **Upright gauge** -- applied automatically whenever `gravity` is supplied. The solution is
+ *    determined only up to a global rotation per component, so that rotation is CHOSEN to stand the
+ *    map upright instead of pinning an arbitrary anchor to the identity. Being a gauge change it is
+ *    exactly zero-bias: every relative rotation is untouched. Its real value is that per-node tilt
+ *    then becomes meaningful, which turns it into a pose-free detector for upside-down scans.
+ * 2. **Virtual node** -- opt-in via `virtual_node_eta > 0`. Gravity is folded into the
+ *    eigenproblem as a fictitious world node joined to every scan. That node is a hub, so it
+ *    collapses the graph diameter and sharply improves conditioning (algebraic connectivity rose
+ *    ~240x on a 60-node chain in testing). It is off by default simply because it needs a strength
+ *    chosen against how much the gravity readings are trusted: with readings that agree with the
+ *    correspondences it costs no accuracy at all, but where they disagree it pulls the solution
+ *    toward gravity in proportion to eta. See RotationSyncParams::upright_prior_eta.
+ *
+ * \attention Neither mechanism REPAIRS an upside-down scan. Gravity pins pitch and roll and says
+ * nothing about yaw, whereas a 180-degree flip is a tilt composed with a 180-degree yaw. Use the
+ * reported tilt to find the bad scan, then re-estimate it from its already-posed neighbours.
+ */
+struct UprightPrior {
+  /**
+   * Gravity in each scan's OWN local frame, sized clouds.size(). Empty (the default) disables the
+   * prior. A zero vector marks a scan with no reading, which is skipped -- so partial coverage is
+   * fine. Magnitude is irrelevant (normalized internally); for scans from a levelled mount, passing
+   * the same vector for every scan is correct and sufficient.
+   */
+  std::vector<Eigen::Vector3d> gravity;
+  /** The world "up" direction that `gravity` should map onto. Normalized internally. */
+  Eigen::Vector3d world_up = Eigen::Vector3d::UnitZ();
+  /**
+   * Strength of the virtual-node prior. 0 (default) means gauge alignment only. Positive values
+   * additionally improve conditioning; they cost nothing on gravity-consistent data, and where the
+   * readings disagree with the correspondences they weigh gravity against them in proportion to
+   * eta. Start around 0.1-1 relative to typical edge confidences.
+   */
+  double virtual_node_eta = 0.0;
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+
+/**
  * Align a set of overlapping scans into a common frame per connected component.
  *
  * Shared pipeline: split the adjacency graph into connected components (a warning is emitted if
@@ -195,13 +243,17 @@ struct MultiScanResult {
  * @param correspondences [in] keyed by (min(i,j), max(i,j)); each pair (a,b) is
  *        (index into cloud[min], index into cloud[max])
  * @param params [in] parameters forwarded to the per-node robust solve
+ * @param upright [in] optional gravity prior; default-constructed disables it. When supplied, each
+ *        component's gauge is chosen to stand the map upright rather than pinning its anchor to the
+ *        identity -- so poses[anchor] is no longer the identity rotation (its translation is still
+ *        zero). See UprightPrior.
  * @return per-node global poses, validity, and component labeling
  */
 MultiScanResult alignMultiScan(
     const std::vector<teaser::PointCloud>& clouds, const teaser::Graph& adjacency,
     const std::map<std::pair<int, int>, double>& edge_weights,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
-    const RobustRegistrationSolver::Params& params);
+    const RobustRegistrationSolver::Params& params, const UprightPrior& upright = UprightPrior());
 
 /**
  * Align a set of overlapping scans given a caller-provided graph (MST step skipped).
@@ -245,6 +297,7 @@ MultiScanResult alignMultiScanWithGraph(
     const std::vector<std::pair<int, int>>& graph_edges,
     const std::map<std::pair<int, int>, std::vector<std::pair<int, int>>>& correspondences,
     const RobustRegistrationSolver::Params& params, const std::vector<int>& order = {},
-    const std::vector<double>& edge_weights = {});
+    const std::vector<double>& edge_weights = {},
+    const UprightPrior& upright = UprightPrior());
 
 } // namespace teaser
